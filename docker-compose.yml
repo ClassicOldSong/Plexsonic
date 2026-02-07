@@ -1,0 +1,24 @@
+services:
+  plexsonic:
+    container_name: plexsonic
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "${PORT:-3127}"
+      BIND_HOST: "${BIND_HOST:-0.0.0.0}"
+      BASE_URL: "${BASE_URL:-}"
+      SQLITE_PATH: "${SQLITE_PATH:-/app/data/app.db}"
+      SESSION_SECRET: "${SESSION_SECRET:-change-this-session-secret}"
+      TOKEN_ENC_KEY: "${TOKEN_ENC_KEY:-}"
+      PLEX_PRODUCT: "${PLEX_PRODUCT:-Plexsonic Bridge}"
+      PLEX_CLIENT_IDENTIFIER: "${PLEX_CLIENT_IDENTIFIER:-}"
+      LICENSE_EMAIL: "${LICENSE_EMAIL:-}"
+      PLEX_INSECURE_TLS: "${PLEX_INSECURE_TLS:-0}"
+      LOG_LEVEL: "${LOG_LEVEL:-warn}"
+      LOG_REQUESTS: "${LOG_REQUESTS:-0}"
+    ports:
+      - "${PORT:-3127}:${PORT:-3127}"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

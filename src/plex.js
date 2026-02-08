@@ -18,6 +18,8 @@
  * under the License.
  */
 
+import { APP_VERSION } from './version.js';
+
 const PLEX_TV_BASE = 'https://plex.tv';
 const PLEX_CLIENTS_BASE = 'https://clients.plex.tv';
 
@@ -25,7 +27,7 @@ function makePlexHeaders(config, token = null) {
   const headers = {
     Accept: 'application/json',
     'X-Plex-Product': config.plexProduct,
-    'X-Plex-Version': '0.1.0',
+    'X-Plex-Version': APP_VERSION,
     'X-Plex-Client-Identifier': config.plexClientIdentifier,
     'X-Plex-Platform': process.platform,
     'X-Plex-Device': 'Plexsonic Bridge',

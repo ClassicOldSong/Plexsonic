@@ -18,11 +18,13 @@
  * under the License.
  */
 
+import { APP_VERSION } from './version.js';
+
 const XML_HEADER = '<?xml version="1.0" encoding="UTF-8"?>';
 const XMLNS = 'http://subsonic.org/restapi';
 const API_VERSION = '1.16.1';
 const SERVER_TYPE = 'Plexsonic';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = APP_VERSION;
 const OPEN_SUBSONIC = true;
 
 const TOKEN_START = '\u0001';

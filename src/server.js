@@ -73,6 +73,39 @@ import { createTokenCipher } from './token-crypto.js';
 import { emptyNode, failedResponse, failedResponseJson, node, okResponse, okResponseJson } from './subsonic-xml.js';
 
 const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,32}$/;
+const DEFAULT_CORS_ALLOW_HEADERS = [
+  'Accept',
+  'Authorization',
+  'Content-Type',
+  'X-Requested-With',
+  'X-Plex-Token',
+  'X-Plex-Client-Identifier',
+  'X-Plex-Product',
+  'X-Plex-Version',
+  'X-Plex-Platform',
+  'X-Plex-Device',
+  'X-Plex-Device-Name',
+  'X-Plex-Model',
+].join(', ');
+const DEFAULT_CORS_ALLOW_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
+const DEFAULT_CORS_EXPOSE_HEADERS = 'content-type, content-length, content-range, accept-ranges, etag, last-modified';
+
+function applyCorsHeaders(request, reply) {
+  const origin = firstForwardedValue(request.headers?.origin);
+  if (origin) {
+    reply.header('access-control-allow-origin', origin);
+    reply.header('vary', 'Origin');
+  } else {
+    reply.header('access-control-allow-origin', '*');
+  }
+
+  reply.header('access-control-allow-methods', DEFAULT_CORS_ALLOW_METHODS);
+
+  const requestedHeaders = firstForwardedValue(request.headers?.['access-control-request-headers']);
+  reply.header('access-control-allow-headers', requestedHeaders || DEFAULT_CORS_ALLOW_HEADERS);
+  reply.header('access-control-expose-headers', DEFAULT_CORS_EXPOSE_HEADERS);
+  reply.header('access-control-max-age', '86400');
+}
 
 function normalizeUsername(value) {
   return String(value || '').trim();
@@ -1979,6 +2012,13 @@ export async function buildServer(config = loadConfig()) {
       sameSite: 'lax',
       secure: false,
     },
+  });
+
+  app.addHook('onRequest', async (request, reply) => {
+    applyCorsHeaders(request, reply);
+    if (request.method === 'OPTIONS') {
+      return reply.code(204).send();
+    }
   });
 
   app.addHook('onClose', async () => {

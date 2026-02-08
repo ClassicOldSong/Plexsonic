@@ -384,6 +384,31 @@ function decodePasswordParam(rawPassword) {
   }
 }
 
+function syncStoredSubsonicPassword(repo, tokenCipher, account, clearPassword) {
+  const normalizedPassword = String(clearPassword || '');
+  if (!account || !account.id || !normalizedPassword) {
+    return;
+  }
+
+  let shouldUpdate = false;
+  if (!account.subsonic_password_enc) {
+    shouldUpdate = true;
+  } else {
+    try {
+      const decrypted = tokenCipher.decrypt(account.subsonic_password_enc);
+      if (decrypted !== normalizedPassword) {
+        shouldUpdate = true;
+      }
+    } catch {
+      shouldUpdate = true;
+    }
+  }
+
+  if (shouldUpdate) {
+    repo.updateSubsonicPasswordEnc(account.id, tokenCipher.encrypt(normalizedPassword));
+  }
+}
+
 async function authenticateSubsonicRequest(request, reply, repo, tokenCipher) {
   const username = normalizeUsername(getRequestParam(request, 'u'));
   const passwordRaw = normalizePassword(getRequestParam(request, 'p'));
@@ -457,9 +482,7 @@ async function authenticateSubsonicRequest(request, reply, repo, tokenCipher) {
       return null;
     }
 
-    if (!account.subsonic_password_enc) {
-      repo.updateSubsonicPasswordEnc(account.id, tokenCipher.encrypt(decodedPassword));
-    }
+    syncStoredSubsonicPassword(repo, tokenCipher, account, decodedPassword);
 
     return account;
   }
@@ -2397,9 +2420,7 @@ export async function buildServer(config = loadConfig()) {
       return reply.code(401).type('text/html; charset=utf-8').send(loginPage('Invalid username or password.'));
     }
 
-    if (!account.subsonic_password_enc) {
-      repo.updateSubsonicPasswordEnc(account.id, tokenCipher.encrypt(password));
-    }
+    syncStoredSubsonicPassword(repo, tokenCipher, account, password);
 
     request.session.accountId = account.id;
     request.session.username = account.username;
@@ -2457,9 +2478,7 @@ export async function buildServer(config = loadConfig()) {
       });
     }
 
-    if (!account.subsonic_password_enc) {
-      repo.updateSubsonicPasswordEnc(account.id, tokenCipher.encrypt(password));
-    }
+    syncStoredSubsonicPassword(repo, tokenCipher, account, password);
 
     request.session.accountId = account.id;
     request.session.username = account.username;

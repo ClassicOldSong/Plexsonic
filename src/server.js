@@ -24,6 +24,7 @@ import Fastify from 'fastify';
 import argon2 from 'argon2';
 import fastifyCookie from '@fastify/cookie';
 import fastifyFormbody from '@fastify/formbody';
+import fastifyMultipart from '@fastify/multipart';
 import fastifySession from '@fastify/session';
 import { loadConfig } from './config.js';
 import { createRepositories, migrate, openDatabase } from './db.js';
@@ -61,6 +62,7 @@ import {
   listMusicSections,
   listPlexServers,
   pollPlexPin,
+  probeSectionFingerprint,
   ratePlexItem,
   removePlexPlaylistItems,
   renamePlexPlaylist,
@@ -89,6 +91,14 @@ const DEFAULT_CORS_ALLOW_HEADERS = [
 ].join(', ');
 const DEFAULT_CORS_ALLOW_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
 const DEFAULT_CORS_EXPOSE_HEADERS = 'content-type, content-length, content-range, accept-ranges, etag, last-modified';
+const CACHE_INVALIDATING_PLEX_MEDIA_EVENTS = new Set([
+  'media.add',
+  'media.delete',
+]);
+const CACHE_PATCHABLE_PLEX_MEDIA_EVENTS = new Set([
+  'media.rate',
+  'media.unrate',
+]);
 
 function applyCorsHeaders(request, reply) {
   const origin = firstForwardedValue(request.headers?.origin);
@@ -168,6 +178,133 @@ function getBodyFirst(request, key) {
     return value[0];
   }
   return '';
+}
+
+function getBodyFieldValue(body, key) {
+  const value = body?.[key];
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (value && typeof value === 'object' && typeof value.value === 'string') {
+    return value.value;
+  }
+  return '';
+}
+
+function parsePlexWebhookPayload(body) {
+  const parseMaybeJson = (value) => {
+    if (!value || typeof value !== 'string') {
+      return null;
+    }
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  };
+
+  if (!body) {
+    return null;
+  }
+
+  if (typeof body === 'string') {
+    return parseMaybeJson(body);
+  }
+
+  if (typeof body !== 'object') {
+    return null;
+  }
+
+  const payloadField = getBodyFieldValue(body, 'payload');
+  const parsedPayload = parseMaybeJson(payloadField);
+  if (parsedPayload && typeof parsedPayload === 'object') {
+    return parsedPayload;
+  }
+
+  if (body.event || body.Metadata || body.Account || body.Server) {
+    return body;
+  }
+
+  return null;
+}
+
+function isMusicWebhookPayload(payload) {
+  const metadata = payload?.Metadata || payload?.metadata || null;
+  if (!metadata) {
+    return true;
+  }
+
+  const sectionType = safeLower(metadata.librarySectionType);
+  if (sectionType) {
+    return sectionType === 'music' || sectionType === 'artist';
+  }
+
+  const metadataType = safeLower(metadata.type);
+  if (!metadataType) {
+    return true;
+  }
+
+  return metadataType === 'track' ||
+    metadataType === 'album' ||
+    metadataType === 'artist' ||
+    metadataType === 'playlist';
+}
+
+function shouldInvalidateCacheForPlexWebhook(payload) {
+  if (!payload || !isMusicWebhookPayload(payload)) {
+    return false;
+  }
+
+  const event = safeLower(payload.event);
+  if (!event) {
+    return false;
+  }
+
+  if (event.startsWith('library.')) {
+    return true;
+  }
+
+  return CACHE_INVALIDATING_PLEX_MEDIA_EVENTS.has(event);
+}
+
+function isRatingPatchableWebhookEvent(event) {
+  return CACHE_PATCHABLE_PLEX_MEDIA_EVENTS.has(safeLower(event));
+}
+
+function extractRatingPatchFromWebhook(payload) {
+  if (!payload) {
+    return null;
+  }
+
+  const event = safeLower(payload.event);
+  if (!isRatingPatchableWebhookEvent(event)) {
+    return null;
+  }
+
+  const metadata = payload.Metadata || payload.metadata || {};
+  const ratingKey = String(metadata.ratingKey || '').trim();
+  if (!ratingKey) {
+    return null;
+  }
+
+  if (event === 'media.unrate') {
+    return {
+      itemIds: [ratingKey],
+      userRating: 0,
+    };
+  }
+
+  const explicitRating = normalizePlexRating(
+    metadata.userRating ?? metadata.rating ?? payload.userRating ?? payload.rating,
+  );
+  if (explicitRating != null) {
+    return {
+      itemIds: [ratingKey],
+      userRating: explicitRating,
+    };
+  }
+
+  return null;
 }
 
 function getRequestParam(request, key) {
@@ -717,12 +854,56 @@ function normalizePlexRating(value) {
   return Math.max(0, Math.min(parsed, 10));
 }
 
-function plexRatingToSubsonic(value) {
+function normalizePlexRatingInt(value) {
   const normalized = normalizePlexRating(value);
+  if (normalized == null) {
+    return null;
+  }
+  return Math.round(normalized);
+}
+
+function isPlexLiked(value) {
+  const normalized = normalizePlexRatingInt(value);
+  return normalized != null && normalized >= 2 && normalized % 2 === 0;
+}
+
+function subsonicRatingToPlexRating(value, { liked = false } = {}) {
+  const rating = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(rating) || rating <= 0) {
+    return 0;
+  }
+  const bounded = Math.max(1, Math.min(5, rating));
+  const stars = liked ? Math.max(1, bounded) : bounded;
+  return liked ? stars * 2 : (stars * 2) - 1;
+}
+
+function toLikedPlexRating(value) {
+  const normalized = normalizePlexRatingInt(value);
+  if (normalized == null || normalized <= 0) {
+    return 2;
+  }
+  const stars = Math.max(1, Math.min(5, Math.ceil(normalized / 2)));
+  return stars * 2;
+}
+
+function toUnlikedPlexRating(value) {
+  const normalized = normalizePlexRatingInt(value);
+  if (normalized == null || normalized <= 0) {
+    return 0;
+  }
+  const stars = Math.max(1, Math.min(5, Math.ceil(normalized / 2)));
+  return (stars * 2) - 1;
+}
+
+function plexRatingToSubsonic(value) {
+  const normalized = normalizePlexRatingInt(value);
   if (normalized == null) {
     return undefined;
   }
-  return Math.round(normalized / 2);
+  if (normalized <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.min(5, Math.ceil(normalized / 2)));
 }
 
 function subsonicRatingAttrs(item) {
@@ -735,7 +916,7 @@ function subsonicRatingAttrs(item) {
     userRating: plexRatingToSubsonic(plexRating),
   };
 
-  if (plexRating >= 9) {
+  if (isPlexLiked(plexRating)) {
     attrs.starred = toIsoFromEpochSeconds(item?.updatedAt || item?.addedAt);
   }
 
@@ -1693,7 +1874,7 @@ function filterAndSortAlbumList(albums, { type, fromYear, toYear, genre }) {
       });
       break;
     case 'starred':
-      list = list.filter((album) => normalizePlexRating(album?.userRating) >= 9);
+      list = list.filter((album) => isPlexLiked(album?.userRating));
       list.sort((a, b) => {
         const tsA = albumTimestampValue(a, ['updatedAt', 'addedAt']);
         const tsB = albumTimestampValue(b, ['updatedAt', 'addedAt']);
@@ -1773,6 +1954,33 @@ function allGenreTags(item) {
   }
 
   return [...new Set(tags)];
+}
+
+function buildAlbumGenreTagMap(albums) {
+  const map = new Map();
+  for (const album of Array.isArray(albums) ? albums : []) {
+    const albumId = String(album?.ratingKey || '').trim();
+    if (!albumId) {
+      continue;
+    }
+    map.set(albumId, allGenreTags(album));
+  }
+  return map;
+}
+
+function resolvedGenreTagsForTrack(track, albumGenreTagMap) {
+  const directTags = allGenreTags(track);
+  if (directTags.length > 0) {
+    return directTags;
+  }
+
+  const albumId = String(track?.parentRatingKey || '').trim();
+  if (!albumId) {
+    return [];
+  }
+
+  const albumTags = albumGenreTagMap.get(albumId);
+  return Array.isArray(albumTags) ? albumTags : [];
 }
 
 function firstGenreTag(item) {
@@ -2023,6 +2231,9 @@ export async function buildServer(config = loadConfig()) {
 
   await app.register(fastifyCookie);
   await app.register(fastifyFormbody);
+  await app.register(fastifyMultipart, {
+    attachFieldsToBody: true,
+  });
   const sessionStore = createSqliteSessionStore(db, app.log);
   await app.register(fastifySession, {
     secret: config.sessionSecret,
@@ -2056,12 +2267,16 @@ export async function buildServer(config = loadConfig()) {
   const STREAM_PROGRESS_HEARTBEAT_MS = 10000;
   const activeSearchRequests = new Map();
   const searchBrowseCache = new Map();
-  const SEARCH_BROWSE_CACHE_TTL_MS = 15000;
+  const SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS = 15000;
+  const SEARCH_BROWSE_CHANGE_CHECK_DEBOUNCE_MS = 15000;
+  const SEARCH_BROWSE_CACHE_IDLE_TTL_MS = 10 * 60 * 1000;
+  const SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS = 2 * 60 * 1000;
   const SEARCH_BROWSE_CACHE_MAX_ENTRIES = 16;
+  const SEARCH_BROWSE_COLLECTIONS = ['artists', 'albums', 'tracks'];
 
   function pruneSearchBrowseCache(now = Date.now()) {
     for (const [cacheKey, entry] of searchBrowseCache.entries()) {
-      if (!entry || entry.expiresAt <= now) {
+      if (!entry || (now - Number(entry.lastAccessAt || 0)) > SEARCH_BROWSE_CACHE_IDLE_TTL_MS) {
         searchBrowseCache.delete(cacheKey);
       }
     }
@@ -2071,7 +2286,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     const sortedByExpiry = [...searchBrowseCache.entries()]
-      .sort((a, b) => (a[1]?.expiresAt || 0) - (b[1]?.expiresAt || 0));
+      .sort((a, b) => (a[1]?.lastAccessAt || 0) - (b[1]?.lastAccessAt || 0));
     for (const [cacheKey] of sortedByExpiry) {
       if (searchBrowseCache.size <= SEARCH_BROWSE_CACHE_MAX_ENTRIES) {
         break;
@@ -2084,59 +2299,572 @@ export async function buildServer(config = loadConfig()) {
     return `${accountId}:${plexState.machineId}:${plexState.musicSectionId}`;
   }
 
-  function getSearchBrowseCacheEntry(cacheKey) {
-    const now = Date.now();
+  function createSearchBrowseCollectionState() {
+    return {
+      data: null,
+      loading: null,
+      loadedAt: 0,
+      lastRefreshAt: 0,
+    };
+  }
+
+  function getSearchBrowseCacheEntry(cacheKey, now = Date.now()) {
     const existing = searchBrowseCache.get(cacheKey);
-    if (existing && existing.expiresAt > now) {
-      existing.expiresAt = now + SEARCH_BROWSE_CACHE_TTL_MS;
+    if (existing) {
+      existing.lastAccessAt = now;
       return existing;
     }
 
-    if (existing) {
-      searchBrowseCache.delete(cacheKey);
-    }
-
     const created = {
-      expiresAt: now + SEARCH_BROWSE_CACHE_TTL_MS,
-      artists: null,
-      albums: null,
-      tracks: null,
-      loadingArtists: null,
-      loadingAlbums: null,
-      loadingTracks: null,
+      lastAccessAt: now,
+      collections: {
+        artists: createSearchBrowseCollectionState(),
+        albums: createSearchBrowseCollectionState(),
+        tracks: createSearchBrowseCollectionState(),
+      },
+      libraryState: {
+        lastCheckedAt: 0,
+        checking: null,
+        lastFingerprint: '',
+        dirty: false,
+        refreshPromise: null,
+        ratingOverrides: new Map(),
+      },
     };
     searchBrowseCache.set(cacheKey, created);
     pruneSearchBrowseCache(now);
     return created;
   }
 
-  async function getSearchBrowseCollection({ cacheKey, collection, loader }) {
-    const entry = getSearchBrowseCacheEntry(cacheKey);
-    if (Array.isArray(entry[collection])) {
-      return entry[collection];
+  function getSearchBrowseCollectionState(entry, collection) {
+    if (!entry?.collections || !SEARCH_BROWSE_COLLECTIONS.includes(collection)) {
+      throw new Error(`Invalid cache collection: ${collection}`);
+    }
+    return entry.collections[collection];
+  }
+
+  async function loadSearchBrowseCollection({ entry, collection, loader, request = null, background = false }) {
+    const state = getSearchBrowseCollectionState(entry, collection);
+    if (state.loading) {
+      return state.loading;
     }
 
-    const loadingKey = `loading${collection[0].toUpperCase()}${collection.slice(1)}`;
-    if (entry[loadingKey]) {
-      return entry[loadingKey];
-    }
+    state.lastRefreshAt = Date.now();
 
     const pending = (async () => {
       const loaded = await loader();
       return Array.isArray(loaded) ? loaded : [];
     })();
-    entry[loadingKey] = pending;
+    state.loading = pending;
 
     try {
       const loaded = await pending;
-      entry[collection] = loaded;
-      entry.expiresAt = Date.now() + SEARCH_BROWSE_CACHE_TTL_MS;
+      applyRatingOverridesToItems(entry, loaded, Date.now());
+      state.data = loaded;
+      state.loadedAt = Date.now();
       return loaded;
+    } catch (error) {
+      if (background) {
+        request?.log?.debug(error, `Background refresh failed for ${collection} cache`);
+        return Array.isArray(state.data) ? state.data : [];
+      }
+      throw error;
     } finally {
-      if (entry[loadingKey] === pending) {
-        entry[loadingKey] = null;
+      if (state.loading === pending) {
+        state.loading = null;
       }
     }
+  }
+
+  async function loadLibraryArtistsRaw({ plexState }) {
+    const loaded = await listArtists({
+      baseUrl: plexState.baseUrl,
+      plexToken: plexState.plexToken,
+      sectionId: plexState.musicSectionId,
+    });
+    return [...loaded].sort((a, b) => String(a?.title || '').localeCompare(String(b?.title || '')));
+  }
+
+  async function loadLibraryAlbumsRaw({ plexState }) {
+    const loaded = await listAlbums({
+      baseUrl: plexState.baseUrl,
+      plexToken: plexState.plexToken,
+      sectionId: plexState.musicSectionId,
+    });
+    return sortAlbumsByName(loaded);
+  }
+
+  async function loadLibraryTracksRaw({ plexState }) {
+    const loaded = await listTracks({
+      baseUrl: plexState.baseUrl,
+      plexToken: plexState.plexToken,
+      sectionId: plexState.musicSectionId,
+    });
+    return sortTracksForLibraryBrowse(loaded);
+  }
+
+  function getLibraryCollectionLoader(collection, plexState) {
+    if (collection === 'artists') {
+      return () => loadLibraryArtistsRaw({ plexState });
+    }
+    if (collection === 'albums') {
+      return () => loadLibraryAlbumsRaw({ plexState });
+    }
+    if (collection === 'tracks') {
+      return () => loadLibraryTracksRaw({ plexState });
+    }
+    throw new Error(`Unsupported library collection: ${collection}`);
+  }
+
+  function markSearchBrowseCacheDirty(cacheKey = null) {
+    const targets = cacheKey
+      ? [[cacheKey, searchBrowseCache.get(cacheKey)]]
+      : [...searchBrowseCache.entries()];
+
+    for (const [, entry] of targets) {
+      if (!entry?.libraryState) {
+        continue;
+      }
+      entry.libraryState.dirty = true;
+    }
+  }
+
+  function normalizeRatingOverride({ userRating = null, clearUserRating = false }, nowMs) {
+    if (clearUserRating) {
+      return {
+        userRating: 0,
+        updatedAtSeconds: Math.floor(nowMs / 1000),
+        expiresAt: nowMs + SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS,
+      };
+    }
+
+    const normalized = normalizePlexRating(userRating);
+    if (normalized == null) {
+      return null;
+    }
+
+    return {
+      userRating: normalized,
+      updatedAtSeconds: Math.floor(nowMs / 1000),
+      expiresAt: nowMs + SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS,
+    };
+  }
+
+  function pruneExpiredRatingOverrides(entry, nowMs) {
+    const overrides = entry?.libraryState?.ratingOverrides;
+    if (!(overrides instanceof Map)) {
+      return;
+    }
+
+    for (const [itemId, override] of overrides.entries()) {
+      if (!override || Number(override.expiresAt || 0) <= nowMs) {
+        overrides.delete(itemId);
+      }
+    }
+  }
+
+  function recordRatingOverrides(entry, itemIds, ratingPatch, nowMs) {
+    const overrides = entry?.libraryState?.ratingOverrides;
+    if (!(overrides instanceof Map)) {
+      return false;
+    }
+
+    const normalized = normalizeRatingOverride(ratingPatch, nowMs);
+    if (!normalized) {
+      return false;
+    }
+
+    let wrote = false;
+    for (const id of itemIds) {
+      const key = String(id || '').trim();
+      if (!key) {
+        continue;
+      }
+      overrides.set(key, normalized);
+      wrote = true;
+    }
+    return wrote;
+  }
+
+  function applyRatingOverridesToItems(entry, items, nowMs = Date.now()) {
+    const overrides = entry?.libraryState?.ratingOverrides;
+    if (!(overrides instanceof Map) || !Array.isArray(items) || items.length === 0) {
+      return 0;
+    }
+
+    pruneExpiredRatingOverrides(entry, nowMs);
+
+    let patched = 0;
+    for (const item of items) {
+      const ratingKey = String(item?.ratingKey || '').trim();
+      if (!ratingKey) {
+        continue;
+      }
+
+      const override = overrides.get(ratingKey);
+      if (!override) {
+        continue;
+      }
+
+      item.userRating = override.userRating;
+      if (Number.isFinite(override.updatedAtSeconds) && override.updatedAtSeconds > 0) {
+        item.updatedAt = override.updatedAtSeconds;
+      }
+      if (!isPlexLiked(item.userRating)) {
+        delete item.starred;
+        delete item.starredAt;
+      }
+      patched += 1;
+    }
+
+    return patched;
+  }
+
+  function applyUserRatingPatchToCacheEntry(entry, itemIds, { userRating = null, clearUserRating = false }, updatedAtSeconds) {
+    if (!entry?.collections) {
+      return 0;
+    }
+
+    const ids = new Set(
+      (Array.isArray(itemIds) ? itemIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean),
+    );
+    if (ids.size === 0) {
+      return 0;
+    }
+
+    const nowMs = Date.now();
+    recordRatingOverrides(entry, [...ids], { userRating, clearUserRating }, nowMs);
+    pruneExpiredRatingOverrides(entry, nowMs);
+
+    let patchedCount = 0;
+    for (const collection of SEARCH_BROWSE_COLLECTIONS) {
+      const state = entry.collections?.[collection];
+      if (!Array.isArray(state?.data)) {
+        continue;
+      }
+
+      for (const item of state.data) {
+        const ratingKey = String(item?.ratingKey || '').trim();
+        if (!ratingKey || !ids.has(ratingKey)) {
+          continue;
+        }
+        if (clearUserRating) {
+          item.userRating = 0;
+        } else {
+          item.userRating = userRating;
+        }
+        if (!isPlexLiked(item.userRating)) {
+          delete item.starred;
+          delete item.starredAt;
+        }
+        if (Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0) {
+          item.updatedAt = updatedAtSeconds;
+        }
+        patchedCount += 1;
+      }
+    }
+
+    return patchedCount;
+  }
+
+  function applyUserRatingPatchToSearchBrowseCache({ cacheKey = null, itemIds, userRating = null, clearUserRating = false }) {
+    if (!clearUserRating && normalizePlexRating(userRating) == null) {
+      return 0;
+    }
+    const normalizedRating = clearUserRating ? null : normalizePlexRating(userRating);
+
+    const updatedAtSeconds = Math.floor(Date.now() / 1000);
+    let targets;
+    if (cacheKey) {
+      const ensuredEntry = getSearchBrowseCacheEntry(cacheKey, Date.now());
+      targets = [[cacheKey, ensuredEntry]];
+    } else {
+      targets = [...searchBrowseCache.entries()];
+    }
+
+    let patchedCount = 0;
+    for (const [, entry] of targets) {
+      patchedCount += applyUserRatingPatchToCacheEntry(
+        entry,
+        itemIds,
+        {
+          userRating: normalizedRating,
+          clearUserRating,
+        },
+        updatedAtSeconds,
+      );
+    }
+    return patchedCount;
+  }
+
+  function getCachedUserRatingForItem(entry, itemId) {
+    const key = String(itemId || '').trim();
+    if (!key || !entry) {
+      return null;
+    }
+
+    const nowMs = Date.now();
+    pruneExpiredRatingOverrides(entry, nowMs);
+    const override = entry?.libraryState?.ratingOverrides?.get(key);
+    if (override && Number.isFinite(override.userRating)) {
+      return normalizePlexRatingInt(override.userRating);
+    }
+
+    for (const collection of SEARCH_BROWSE_COLLECTIONS) {
+      const state = entry.collections?.[collection];
+      if (!Array.isArray(state?.data)) {
+        continue;
+      }
+
+      const found = state.data.find((item) => String(item?.ratingKey || '').trim() === key);
+      if (!found) {
+        continue;
+      }
+      return normalizePlexRatingInt(found.userRating);
+    }
+
+    return null;
+  }
+
+  async function getLibraryFingerprint({ plexState }) {
+    const sectionId = String(plexState.musicSectionId || '');
+    const [sections, probe] = await Promise.all([
+      listMusicSections({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+      }),
+      probeSectionFingerprint({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+        sectionId,
+      }).catch(() => ''),
+    ]);
+
+    const section = sections.find((item) => String(item?.id || '') === sectionId);
+    const sectionPart = section
+      ? `${section.id}|${section.updatedAt}|${section.scannedAt}|${section.refreshedAt}|${section.contentChangedAt}|${section.leafCount}`
+      : `${sectionId}|missing`;
+    return `${sectionPart}|${probe || ''}`;
+  }
+
+  async function refreshSearchBrowseCollectionsForEntry({ entry, plexState, request }) {
+    await Promise.all(
+      SEARCH_BROWSE_COLLECTIONS.map((collection) =>
+        loadSearchBrowseCollection({
+          entry,
+          collection,
+          loader: getLibraryCollectionLoader(collection, plexState),
+          request,
+          background: false,
+        }),
+      ),
+    );
+    entry.libraryState.dirty = false;
+  }
+
+  async function ensureDirtySearchBrowseRefresh({
+    entry,
+    cacheKey,
+    plexState,
+    request,
+    wait = false,
+  }) {
+    if (!entry?.libraryState?.dirty) {
+      return;
+    }
+
+    const libraryState = entry.libraryState;
+    if (!libraryState.refreshPromise) {
+      const pending = (async () => {
+        try {
+          await refreshSearchBrowseCollectionsForEntry({ entry, plexState, request });
+        } catch (error) {
+          request?.log?.warn(error, `Failed to refresh stale cache for ${cacheKey}`);
+          throw error;
+        } finally {
+          if (libraryState.refreshPromise === pending) {
+            libraryState.refreshPromise = null;
+          }
+        }
+      })();
+      libraryState.refreshPromise = pending;
+    }
+
+    if (wait && libraryState.refreshPromise) {
+      try {
+        await libraryState.refreshPromise;
+      } catch {
+        // Keep serving stale cache on refresh failures.
+      }
+    }
+  }
+
+  function maybeCheckLibraryChanges({ entry, cacheKey, plexState, request }) {
+    if (!request || !entry?.libraryState) {
+      return;
+    }
+
+    const libraryState = entry.libraryState;
+    const now = Date.now();
+    if (libraryState.checking) {
+      return;
+    }
+    if ((now - Number(libraryState.lastCheckedAt || 0)) < SEARCH_BROWSE_CHANGE_CHECK_DEBOUNCE_MS) {
+      return;
+    }
+
+    libraryState.lastCheckedAt = now;
+    const pending = (async () => {
+      try {
+        const fingerprint = await getLibraryFingerprint({ plexState });
+        if (!fingerprint) {
+          return;
+        }
+
+        if (!libraryState.lastFingerprint) {
+          libraryState.lastFingerprint = fingerprint;
+          return;
+        }
+
+        if (libraryState.lastFingerprint !== fingerprint) {
+          libraryState.lastFingerprint = fingerprint;
+          libraryState.dirty = true;
+          request.log.info({ cacheKey }, 'Plex library change detected, refreshing cache');
+          await ensureDirtySearchBrowseRefresh({
+            entry,
+            cacheKey,
+            plexState,
+            request,
+            wait: false,
+          });
+        }
+      } catch (error) {
+        request.log.debug(error, `Failed to check library changes for ${cacheKey}`);
+      } finally {
+        if (libraryState.checking === pending) {
+          libraryState.checking = null;
+        }
+      }
+    })();
+    libraryState.checking = pending;
+  }
+
+  function hasCachedLibraryData(entry) {
+    if (!entry?.collections) {
+      return false;
+    }
+    return SEARCH_BROWSE_COLLECTIONS.some((collection) => Array.isArray(entry.collections?.[collection]?.data));
+  }
+
+  function shouldRunLibraryCheckForRequest(request, cacheKey) {
+    if (!request) {
+      return true;
+    }
+
+    const markerKey = '__plexsonicLibraryChecks';
+    let checkedCacheKeys = request[markerKey];
+    if (!(checkedCacheKeys instanceof Set)) {
+      checkedCacheKeys = new Set();
+      request[markerKey] = checkedCacheKeys;
+    }
+
+    if (checkedCacheKeys.has(cacheKey)) {
+      return false;
+    }
+
+    checkedCacheKeys.add(cacheKey);
+    return true;
+  }
+
+  async function getSearchBrowseCollection({ cacheKey, collection, loader, plexState, request = null }) {
+    const now = Date.now();
+    const entry = getSearchBrowseCacheEntry(cacheKey, now);
+    const state = getSearchBrowseCollectionState(entry, collection);
+
+    if (hasCachedLibraryData(entry) && shouldRunLibraryCheckForRequest(request, cacheKey)) {
+      maybeCheckLibraryChanges({ entry, cacheKey, plexState, request });
+    }
+    await ensureDirtySearchBrowseRefresh({
+      entry,
+      cacheKey,
+      plexState,
+      request,
+      wait: true,
+    });
+
+    if (Array.isArray(state.data)) {
+      const isStale = (now - Number(state.loadedAt || 0)) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
+      const canRefresh = (now - Number(state.lastRefreshAt || 0)) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
+      if (isStale && canRefresh && !state.loading) {
+        void loadSearchBrowseCollection({
+          entry,
+          collection,
+          loader,
+          request,
+          background: true,
+        });
+      }
+      return state.data;
+    }
+
+    if (state.loading) {
+      return state.loading;
+    }
+
+    return loadSearchBrowseCollection({
+      entry,
+      collection,
+      loader,
+      request,
+      background: false,
+    });
+  }
+
+  async function getCachedLibraryArtists({ accountId, plexState, request }) {
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    return getSearchBrowseCollection({
+      cacheKey,
+      collection: 'artists',
+      plexState,
+      request,
+      loader: () => loadLibraryArtistsRaw({ plexState }),
+    });
+  }
+
+  async function getCachedLibraryAlbums({ accountId, plexState, request }) {
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    return getSearchBrowseCollection({
+      cacheKey,
+      collection: 'albums',
+      plexState,
+      request,
+      loader: () => loadLibraryAlbumsRaw({ plexState }),
+    });
+  }
+
+  async function getCachedLibraryTracks({ accountId, plexState, request }) {
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    return getSearchBrowseCollection({
+      cacheKey,
+      collection: 'tracks',
+      plexState,
+      request,
+      loader: () => loadLibraryTracksRaw({ plexState }),
+    });
+  }
+
+  function applyCachedRatingOverridesForAccount({ accountId, plexState, items }) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return 0;
+    }
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    const entry = searchBrowseCache.get(cacheKey);
+    if (!entry) {
+      return 0;
+    }
+    return applyRatingOverridesToItems(entry, items, Date.now());
   }
 
   function beginSearchRequest(request, accountId) {
@@ -2328,6 +3056,53 @@ export async function buildServer(config = loadConfig()) {
   });
 
   app.get('/health', async () => ({ status: 'ok' }));
+
+  app.post('/webhooks/plex', async (request, reply) => {
+    const expectedToken = String(config.plexWebhookToken || '').trim();
+    const providedToken = String(
+      firstForwardedValue(request.headers?.['x-plexsonic-webhook-token']) ||
+      getQueryFirst(request, 'token') ||
+      getBodyFieldValue(request.body, 'token') ||
+      '',
+    ).trim();
+
+    if (expectedToken && providedToken !== expectedToken) {
+      request.log.warn({ ip: request.ip }, 'Rejected Plex webhook with invalid token');
+      return reply.code(403).send({ ok: false });
+    }
+
+    const payload = parsePlexWebhookPayload(request.body);
+    const event = String(payload?.event || '').trim() || 'unknown';
+    if (isRatingPatchableWebhookEvent(event)) {
+      const ratingPatch = extractRatingPatchFromWebhook(payload);
+      if (ratingPatch) {
+        const patchedCount = applyUserRatingPatchToSearchBrowseCache({
+          itemIds: ratingPatch.itemIds,
+          userRating: ratingPatch.userRating,
+          clearUserRating: ratingPatch.clearUserRating,
+        });
+        if (patchedCount === 0) {
+          markSearchBrowseCacheDirty();
+        }
+        request.log.info({ event, patchedCount }, 'Plex webhook rating event applied to cache');
+        return reply.code(202).send({ ok: true, patched: patchedCount });
+      }
+
+      markSearchBrowseCacheDirty();
+      request.log.info({ event }, 'Plex webhook rating event missing metadata, marked caches dirty');
+      return reply.code(202).send({ ok: true });
+    }
+
+    if (!shouldInvalidateCacheForPlexWebhook(payload)) {
+      request.log.debug({ event }, 'Plex webhook ignored (non-library-changing event)');
+      return reply.code(202).send({ ok: true, ignored: true });
+    }
+
+    markSearchBrowseCacheDirty();
+    request.log.info({ event }, 'Plex webhook received, marked caches dirty');
+
+    return reply.code(202).send({ ok: true });
+  });
 
   app.get('/', async (request, reply) => {
     if (request.session.accountId) {
@@ -3111,25 +3886,13 @@ export async function buildServer(config = loadConfig()) {
 
     try {
       const [artists, albums, tracks] = await Promise.all([
-        listArtists({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
-        listAlbums({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
-        listTracks({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
+        getCachedLibraryArtists({ accountId: account.id, plexState, request }),
+        getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
+        getCachedLibraryTracks({ accountId: account.id, plexState, request }),
       ]);
 
       const starredArtists = artists
-        .filter((artist) => normalizePlexRating(artist.userRating) >= 9)
+        .filter((artist) => isPlexLiked(artist.userRating))
         .map((artist) =>
           emptyNode('artist', {
             id: artist.ratingKey,
@@ -3141,12 +3904,12 @@ export async function buildServer(config = loadConfig()) {
         .join('');
 
       const starredAlbums = albums
-        .filter((album) => normalizePlexRating(album.userRating) >= 9)
+        .filter((album) => isPlexLiked(album.userRating))
         .map((album) => emptyNode('album', albumAttrs(album)))
         .join('');
 
       const starredSongs = tracks
-        .filter((track) => normalizePlexRating(track.userRating) >= 9)
+        .filter((track) => isPlexLiked(track.userRating))
         .map((track) => emptyNode('song', songAttrs(track)))
         .join('');
 
@@ -3171,25 +3934,13 @@ export async function buildServer(config = loadConfig()) {
 
     try {
       const [artists, albums, tracks] = await Promise.all([
-        listArtists({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
-        listAlbums({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
-        listTracks({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        }),
+        getCachedLibraryArtists({ accountId: account.id, plexState, request }),
+        getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
+        getCachedLibraryTracks({ accountId: account.id, plexState, request }),
       ]);
 
       const starredArtists = artists
-        .filter((artist) => normalizePlexRating(artist.userRating) >= 9)
+        .filter((artist) => isPlexLiked(artist.userRating))
         .map((artist) =>
           emptyNode('artist', {
             id: artist.ratingKey,
@@ -3202,12 +3953,12 @@ export async function buildServer(config = loadConfig()) {
         .join('');
 
       const starredAlbums = albums
-        .filter((album) => normalizePlexRating(album.userRating) >= 9)
+        .filter((album) => isPlexLiked(album.userRating))
         .map((album) => emptyNode('album', albumId3Attrs(album)))
         .join('');
 
       const starredSongs = tracks
-        .filter((track) => normalizePlexRating(track.userRating) >= 9)
+        .filter((track) => isPlexLiked(track.userRating))
         .map((track) => emptyNode('song', songAttrs(track)))
         .join('');
 
@@ -3234,16 +3985,16 @@ export async function buildServer(config = loadConfig()) {
       }
 
       try {
-        const albums = await listAlbums({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        });
+        const [albums, tracks] = await Promise.all([
+          getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
+          getCachedLibraryTracks({ accountId: account.id, plexState, request }),
+        ]);
 
+        const albumGenreTagMap = buildAlbumGenreTagMap(albums);
         const counts = new Map();
-        for (const album of albums) {
-          const albumSongCount = Math.max(1, Number.parseInt(String(album?.leafCount ?? ''), 10) || 0);
-          for (const tag of allGenreTags(album)) {
+        for (const track of tracks) {
+          const albumId = String(track?.parentRatingKey || '').trim();
+          for (const tag of resolvedGenreTagsForTrack(track, albumGenreTagMap)) {
             const normalized = tag.trim();
             if (!normalized) {
               continue;
@@ -3252,10 +4003,12 @@ export async function buildServer(config = loadConfig()) {
             const current = counts.get(key) || {
               name: normalized,
               songCount: 0,
-              albumCount: 0,
+              albumIds: new Set(),
             };
-            current.songCount += albumSongCount;
-            current.albumCount += 1;
+            current.songCount += 1;
+            if (albumId) {
+              current.albumIds.add(albumId);
+            }
             counts.set(key, current);
           }
         }
@@ -3267,7 +4020,7 @@ export async function buildServer(config = loadConfig()) {
               'genre',
               {
                 songCount: genre.songCount,
-                albumCount: genre.albumCount,
+                albumCount: genre.albumIds.size,
               },
               genre.name,
             ),
@@ -3306,34 +4059,21 @@ export async function buildServer(config = loadConfig()) {
       }
 
       try {
-        const albums = await listAlbums({
-          baseUrl: plexState.baseUrl,
-          plexToken: plexState.plexToken,
-          sectionId: plexState.musicSectionId,
-        });
+        const [albums, tracks] = await Promise.all([
+          getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
+          getCachedLibraryTracks({ accountId: account.id, plexState, request }),
+        ]);
 
-        const matchedAlbums = albums.filter((album) =>
-          allGenreTags(album).some((tag) => safeLower(tag.trim()) === safeLower(genre)),
+        const targetGenre = safeLower(genre);
+        const albumGenreTagMap = buildAlbumGenreTagMap(albums);
+        const matchedSongs = tracks.filter((track) =>
+          resolvedGenreTagsForTrack(track, albumGenreTagMap).some(
+            (tag) => safeLower(String(tag || '').trim()) === targetGenre,
+          ),
         );
 
-        const songs = [];
-        for (const album of matchedAlbums) {
-          const tracks = await listAlbumTracks({
-            baseUrl: plexState.baseUrl,
-            plexToken: plexState.plexToken,
-            albumId: album.ratingKey,
-          });
-
-          for (const track of tracks) {
-            songs.push(track);
-          }
-
-          if (songs.length >= offset + count) {
-            break;
-          }
-        }
-
-        const page = takePage(songs, offset, count);
+        const sortedSongs = sortTracksForLibraryBrowse(matchedSongs);
+        const page = takePage(sortedSongs, offset, count);
         const songXml = page.map((track) => emptyNode('song', songAttrs(track))).join('');
         return sendSubsonicOk(reply, node('songsByGenre', {}, songXml));
       } catch (error) {
@@ -3358,11 +4098,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const allTracks = await listTracks({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        sectionId: plexState.musicSectionId,
-      });
+      const allTracks = await getCachedLibraryTracks({ accountId: account.id, plexState, request });
 
       const randomTracks = shuffleInPlace(allTracks.slice()).slice(0, size);
       const songXml = randomTracks.map((track) => emptyNode('song', songAttrs(track))).join('');
@@ -3392,11 +4128,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const artists = await listArtists({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        sectionId: plexState.musicSectionId,
-      });
+      const artists = await getCachedLibraryArtists({ accountId: account.id, plexState, request });
 
       const artist =
         artists.find((item) => safeLower(item.title) === safeLower(artistName)) ||
@@ -3410,6 +4142,7 @@ export async function buildServer(config = loadConfig()) {
         plexToken: plexState.plexToken,
         artistId: artist.ratingKey,
       });
+      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
       const topTracks = tracks.slice(0, size);
       const songXml = topTracks.map((track) => emptyNode('song', songAttrs(track))).join('');
@@ -3531,6 +4264,7 @@ export async function buildServer(config = loadConfig()) {
         if (tracks == null) {
           return sendSubsonicError(reply, 70, 'Item not found');
         }
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
         const songXml = tracks.map((track) => emptyNode('song', songAttrs(track))).join('');
         return sendSubsonicOk(reply, node('similarSongs', {}, songXml));
@@ -3574,6 +4308,7 @@ export async function buildServer(config = loadConfig()) {
         if (tracks == null) {
           return sendSubsonicError(reply, 70, 'Item not found');
         }
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
         const songXml = tracks.map((track) => emptyNode('song', songAttrs(track))).join('');
         return sendSubsonicOk(reply, node('similarSongs2', {}, songXml));
@@ -3610,6 +4345,7 @@ export async function buildServer(config = loadConfig()) {
       if (!track) {
         return sendSubsonicError(reply, 70, 'Song not found');
       }
+      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [track] });
 
       return sendSubsonicOk(reply, node('song', songAttrs(track)));
     } catch (error) {
@@ -3863,51 +4599,15 @@ export async function buildServer(config = loadConfig()) {
         let matchedTracks = [];
 
         if (!query) {
-          const browseCacheKey = searchBrowseCacheKey(account.id, plexState);
           const [artists, albums, tracks] = await Promise.all([
             artistCount > 0
-              ? getSearchBrowseCollection({
-                  cacheKey: browseCacheKey,
-                  collection: 'artists',
-                  loader: async () => {
-                    const loaded = await listArtists({
-                      baseUrl: plexState.baseUrl,
-                      plexToken: plexState.plexToken,
-                      sectionId: plexState.musicSectionId,
-                    });
-                    return [...loaded].sort((a, b) =>
-                      String(a?.title || '').localeCompare(String(b?.title || '')),
-                    );
-                  },
-                })
+              ? getCachedLibraryArtists({ accountId: account.id, plexState, request })
               : [],
             albumCount > 0
-              ? getSearchBrowseCollection({
-                  cacheKey: browseCacheKey,
-                  collection: 'albums',
-                  loader: async () => {
-                    const loaded = await listAlbums({
-                      baseUrl: plexState.baseUrl,
-                      plexToken: plexState.plexToken,
-                      sectionId: plexState.musicSectionId,
-                    });
-                    return sortAlbumsByName(loaded);
-                  },
-                })
+              ? getCachedLibraryAlbums({ accountId: account.id, plexState, request })
               : [],
             songCount > 0
-              ? getSearchBrowseCollection({
-                  cacheKey: browseCacheKey,
-                  collection: 'tracks',
-                  loader: async () => {
-                    const loaded = await listTracks({
-                      baseUrl: plexState.baseUrl,
-                      plexToken: plexState.plexToken,
-                      sectionId: plexState.musicSectionId,
-                    });
-                    return sortTracksForLibraryBrowse(loaded);
-                  },
-                })
+              ? getCachedLibraryTracks({ accountId: account.id, plexState, request })
               : [],
           ]);
 
@@ -4342,20 +5042,42 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const cacheKey = searchBrowseCacheKey(account.id, plexState);
+      const cacheEntry = searchBrowseCache.get(cacheKey);
+      const actions = ids.map((id) => {
+        const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+        return {
+          id,
+          targetRating: toLikedPlexRating(currentRating),
+        };
+      });
+
       try {
         await Promise.all(
-          ids.map((id) =>
+          actions.map(({ id, targetRating }) =>
             ratePlexItem({
               baseUrl: plexState.baseUrl,
               plexToken: plexState.plexToken,
               itemId: id,
-              rating: 10,
+              rating: targetRating,
             }),
           ),
         );
       } catch (error) {
         request.log.error(error, 'Failed to star item(s) in Plex');
         return sendSubsonicError(reply, 10, 'Failed to star');
+      }
+
+      let patchedCount = 0;
+      for (const { id, targetRating } of actions) {
+        patchedCount += applyUserRatingPatchToSearchBrowseCache({
+          cacheKey,
+          itemIds: [id],
+          userRating: targetRating,
+        });
+      }
+      if (patchedCount === 0) {
+        markSearchBrowseCacheDirty(cacheKey);
       }
 
       return sendSubsonicOk(reply);
@@ -4387,20 +5109,42 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const cacheKey = searchBrowseCacheKey(account.id, plexState);
+      const cacheEntry = searchBrowseCache.get(cacheKey);
+      const actions = ids.map((id) => {
+        const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+        return {
+          id,
+          targetRating: toUnlikedPlexRating(currentRating),
+        };
+      });
+
       try {
         await Promise.all(
-          ids.map((id) =>
+          actions.map(({ id, targetRating }) =>
             ratePlexItem({
               baseUrl: plexState.baseUrl,
               plexToken: plexState.plexToken,
               itemId: id,
-              rating: 0,
+              rating: targetRating,
             }),
           ),
         );
       } catch (error) {
         request.log.error(error, 'Failed to unstar item(s) in Plex');
         return sendSubsonicError(reply, 10, 'Failed to unstar');
+      }
+
+      let patchedCount = 0;
+      for (const { id, targetRating } of actions) {
+        patchedCount += applyUserRatingPatchToSearchBrowseCache({
+          cacheKey,
+          itemIds: [id],
+          userRating: targetRating,
+        });
+      }
+      if (patchedCount === 0) {
+        markSearchBrowseCacheDirty(cacheKey);
       }
 
       return sendSubsonicOk(reply);
@@ -4434,7 +5178,11 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
-      const plexRating = Math.round((rating / 5) * 10);
+      const cacheKey = searchBrowseCacheKey(account.id, plexState);
+      const cacheEntry = searchBrowseCache.get(cacheKey);
+      const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+      const preserveLike = rating >= 2 && isPlexLiked(currentRating);
+      const plexRating = subsonicRatingToPlexRating(rating, { liked: preserveLike });
       try {
         await ratePlexItem({
           baseUrl: plexState.baseUrl,
@@ -4445,6 +5193,15 @@ export async function buildServer(config = loadConfig()) {
       } catch (error) {
         request.log.error(error, 'Failed to set rating in Plex');
         return sendSubsonicError(reply, 10, 'Failed to set rating');
+      }
+
+      const patchedCount = applyUserRatingPatchToSearchBrowseCache({
+        cacheKey,
+        itemIds: [id],
+        userRating: plexRating,
+      });
+      if (patchedCount === 0) {
+        markSearchBrowseCacheDirty(cacheKey);
       }
 
       return sendSubsonicOk(reply);
@@ -4812,11 +5569,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const artists = await listArtists({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        sectionId: plexState.musicSectionId,
-      });
+      const artists = await getCachedLibraryArtists({ accountId: account.id, plexState, request });
 
       const indexes = groupArtistsForSubsonic(artists).join('');
       return sendSubsonicOk(reply, node('artists', { ignoredArticles: 'The El La Los Las Le Les' }, indexes));
@@ -4907,12 +5660,14 @@ export async function buildServer(config = loadConfig()) {
       if (!artist) {
         return sendSubsonicError(reply, 70, 'Artist not found');
       }
+      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [artist] });
 
       const albums = await listArtistAlbums({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
         artistId,
       });
+      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: albums });
 
       let finalAlbums = albums;
       if (finalAlbums.length === 0) {
@@ -5005,6 +5760,7 @@ export async function buildServer(config = loadConfig()) {
         tracks,
         request,
       });
+      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [album, ...tracksWithGenre] });
       const sortedTracks = sortTracksByDiscAndIndex(tracksWithGenre);
 
       const totalDuration = sortedTracks.reduce((sum, track) => sum + durationSeconds(track.duration), 0);
@@ -5062,6 +5818,7 @@ export async function buildServer(config = loadConfig()) {
           sectionId: plexState.musicSectionId,
           folderPath: explicitFolderPath,
         });
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: folderResult.items });
 
         const currentFolderPath = isRootFolder ? null : explicitFolderPath;
         const currentDirectoryId = isRootFolder
@@ -5132,11 +5889,13 @@ export async function buildServer(config = loadConfig()) {
       });
 
       if (artist) {
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [artist] });
         const albums = await listArtistAlbums({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
           artistId: id,
         });
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: albums });
 
         let finalAlbums = albums;
         if (finalAlbums.length === 0) {
@@ -5184,6 +5943,7 @@ export async function buildServer(config = loadConfig()) {
           tracks,
           request,
         });
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [album, ...tracksWithGenre] });
         const sortedTracks = sortTracksByDiscAndIndex(tracksWithGenre);
 
         const children = sortedTracks
@@ -5259,11 +6019,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const allAlbums = await listAlbums({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        sectionId: plexState.musicSectionId,
-      });
+      const allAlbums = await getCachedLibraryAlbums({ accountId: account.id, plexState, request });
 
       const filtered = filterAndSortAlbumList(allAlbums, {
         type,

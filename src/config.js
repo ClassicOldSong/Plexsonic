@@ -89,6 +89,7 @@ export function loadConfig(env = process.env) {
     plexProduct: env.PLEX_PRODUCT || DEFAULT_PLEX_PRODUCT,
     plexClientIdentifier:
       env.PLEX_CLIENT_IDENTIFIER || deriveClientIdentifier(path.resolve(sqlitePath)),
+    plexWebhookToken: env.PLEX_WEBHOOK_TOKEN || '',
     licenseEmail: env.LICENSE_EMAIL || '',
     logLevel: env.LOG_LEVEL || DEFAULT_LOG_LEVEL,
     logRequests: parseBoolean(env.LOG_REQUESTS, DEFAULT_LOG_REQUESTS),

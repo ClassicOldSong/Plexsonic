@@ -199,10 +199,20 @@ function extractMetadataList(container) {
 }
 
 function normalizeLibrarySection(section) {
+  const parseTimestamp = (value) => {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  };
+
   return {
     id: String(section.key ?? section.id ?? ''),
     title: section.title || section.name || 'Untitled',
     type: section.type || '',
+    updatedAt: parseTimestamp(section.updatedAt),
+    scannedAt: parseTimestamp(section.scannedAt),
+    refreshedAt: parseTimestamp(section.refreshedAt),
+    contentChangedAt: parseTimestamp(section.contentChangedAt),
+    leafCount: parseTimestamp(section.leafCount),
   };
 }
 
@@ -802,6 +812,35 @@ export async function listTracks({ baseUrl, plexToken, sectionId }) {
   });
 
   return extractMetadataList(payload.MediaContainer);
+}
+
+export async function probeSectionFingerprint({ baseUrl, plexToken, sectionId, signal = undefined }) {
+  const payload = await fetchPmsJson(
+    baseUrl,
+    plexToken,
+    `/library/sections/${encodeURIComponent(sectionId)}/all`,
+    {
+      type: 10,
+      sort: 'updatedAt:desc',
+      'X-Plex-Container-Start': 0,
+      'X-Plex-Container-Size': 1,
+    },
+    { signal },
+  );
+
+  const container = payload?.MediaContainer || {};
+  const firstTrack = extractMetadataList(container)[0] || {};
+  const parseIntSafe = (value) => {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  };
+
+  const totalSize = parseIntSafe(container.totalSize);
+  const ratingKey = String(firstTrack.ratingKey || '');
+  const updatedAt = parseIntSafe(firstTrack.updatedAt);
+  const addedAt = parseIntSafe(firstTrack.addedAt);
+
+  return `${sectionId}|${totalSize}|${ratingKey}|${updatedAt}|${addedAt}`;
 }
 
 export async function getArtist({ baseUrl, plexToken, artistId }) {

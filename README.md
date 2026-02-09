@@ -57,6 +57,7 @@ SESSION_SECRET=replace-with-a-long-random-secret
 TOKEN_ENC_KEY=
 PLEX_PRODUCT=Plexsonic Bridge
 PLEX_CLIENT_IDENTIFIER=
+PLEX_WEBHOOK_TOKEN=
 LICENSE_EMAIL=
 PLEX_INSECURE_TLS=0
 LOG_LEVEL=warn
@@ -68,10 +69,11 @@ LOG_REQUESTS=0
 - `PORT`: HTTP port (default `3127`).
 - `BIND_HOST`: listen interface (`127.0.0.1` local only, `0.0.0.0` for LAN).
 - `BASE_URL`: optional public URL override used for callback generation. If empty, origin is derived from request headers.
+- `PLEX_WEBHOOK_TOKEN`: optional shared secret for `/webhooks/plex`. If set, webhook calls must provide this token.
 - `SESSION_SECRET`: cookie/session signing secret. Keep stable across restarts.
 - `TOKEN_ENC_KEY`: optional but recommended 32-byte key (hex or base64) used to encrypt stored Plex tokens.
 - `LOG_LEVEL`: logger level (`trace`, `debug`, `info`, `warn`, `error`, `fatal`).
-- `LOG_REQUESTS`: set to `1` to enable incoming request logs. Very verbose, and can expose your login credeitial. (`0` by default).
+- `LOG_REQUESTS`: set to `1` to enable incoming request logs. Very verbose, and can expose login credentials. (`0` by default).
 
 Generate secrets (examples):
 
@@ -166,6 +168,18 @@ Both endpoint styles are accepted:
 - `/rest/getArtists.view`
 - `/rest/getArtists`
 
+### Star/Like Mapping (Plex)
+
+Plexsonic maps Subsonic rating + star state into a single Plex numeric rating:
+- Odd points = rated only (not liked): `1, 3, 5, 7, 9`
+- Even points = liked: `2, 4, 6, 8, 10`
+- `0` = no rating and not liked
+
+Behavior:
+- `setRating(r)` updates stars and keeps current like state when possible.
+- `star` toggles like on and keeps star level. If unrated, it becomes `2` points (liked + 1-star).
+- `unstar` toggles like off and keeps star level.
+
 ## Expose to LAN
 
 Set:
@@ -183,6 +197,22 @@ Then:
 If you run behind a reverse proxy, forward `X-Forwarded-Proto` and `X-Forwarded-Host` so Plex PIN callbacks use the correct public origin.
 
 Without HTTPS, credentials travel unencrypted on your network.
+
+## Plex Webhooks (Optional, Recommended)
+
+Webhook purpose: Plex notifies Plexsonic on library/media events so Plexsonic can refresh caches faster and reduce stale results.
+
+Plex does not auto-discover Plexsonic. You must add the webhook URL in Plex Media Server settings.
+
+1. Open Plex Media Server settings, then `Network` -> `Webhooks`.
+2. Add your Plexsonic endpoint URL.
+Without token: `http://<your-host>:3127/webhooks/plex`
+With token: `http://<your-host>:3127/webhooks/plex?token=<PLEX_WEBHOOK_TOKEN>`
+3. Save settings in Plex.
+
+Notes:
+- `BASE_URL` is not required for webhook processing.
+- Webhook URL must be reachable by your Plex Media Server (LAN IP/hostname or public URL, depending on your setup).
 
 ## Notes
 

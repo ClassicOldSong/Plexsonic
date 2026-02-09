@@ -934,6 +934,7 @@ function albumAttrs(album, fallbackArtistId = null, fallbackArtistName = null) {
     [album?.parentTitle, fallbackArtistName],
     'Unknown Artist',
   );
+  const genre = firstGenreTag(album) || undefined;
 
   return {
     id: albumId,
@@ -949,6 +950,7 @@ function albumAttrs(album, fallbackArtistId = null, fallbackArtistName = null) {
     duration: durationSeconds(album.duration),
     created: toIsoFromEpochSeconds(album.addedAt),
     year: album.year,
+    genre,
     ...subsonicRatingAttrs(album),
   };
 }
@@ -1052,7 +1054,9 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     [albumCoverArt, track?.parentRatingKey, track?.ratingKey],
     undefined,
   );
-  const genreTags = allGenreTags(track);
+  const albumGenreTags = albumMetadata ? allGenreTags(albumMetadata) : [];
+  const genreTagsRaw = allGenreTags(track);
+  const genreTags = genreTagsRaw.length > 0 ? genreTagsRaw : albumGenreTags;
   const genre = genreTags[0] || undefined;
   const genres = genreTags.length > 0 ? genreTags.join('; ') : undefined;
   const discNumber = parsePositiveInt(track?.parentIndex ?? track?.discNumber, 0) || undefined;
@@ -1690,6 +1694,10 @@ function isAbortError(error) {
   return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 }
 
+function isPlexNotFoundError(error) {
+  return String(error?.message || '').includes('(404)');
+}
+
 function safeLower(value) {
   return String(value || '').toLowerCase();
 }
@@ -1982,6 +1990,24 @@ function resolvedGenreTagsForTrack(track, albumGenreTagMap) {
 
   const albumTags = albumGenreTagMap.get(albumId);
   return Array.isArray(albumTags) ? albumTags : [];
+}
+
+function withResolvedTrackGenres(track, albumGenreTagMap) {
+  const resolvedTags = resolvedGenreTagsForTrack(track, albumGenreTagMap);
+  if (resolvedTags.length === 0) {
+    return track;
+  }
+
+  const currentTags = allGenreTags(track);
+  if (currentTags.length > 0) {
+    return track;
+  }
+
+  return {
+    ...track,
+    Genre: resolvedTags.map((tag) => ({ tag })),
+    genre: resolvedTags.join('; '),
+  };
 }
 
 function firstGenreTag(item) {
@@ -2396,12 +2422,21 @@ export async function buildServer(config = loadConfig()) {
   }
 
   async function loadLibraryTracksRaw({ plexState }) {
-    const loaded = await listTracks({
-      baseUrl: plexState.baseUrl,
-      plexToken: plexState.plexToken,
-      sectionId: plexState.musicSectionId,
-    });
-    return sortTracksForLibraryBrowse(loaded);
+    const [tracks, albums] = await Promise.all([
+      listTracks({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+        sectionId: plexState.musicSectionId,
+      }),
+      listAlbums({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+        sectionId: plexState.musicSectionId,
+      }),
+    ]);
+    const albumGenreTagMap = buildAlbumGenreTagMap(albums);
+    const enrichedTracks = tracks.map((track) => withResolvedTrackGenres(track, albumGenreTagMap));
+    return sortTracksForLibraryBrowse(enrichedTracks);
   }
 
   function getLibraryCollectionLoader(collection, plexState) {
@@ -2866,6 +2901,46 @@ export async function buildServer(config = loadConfig()) {
       return 0;
     }
     return applyRatingOverridesToItems(entry, items, Date.now());
+  }
+
+  async function resolveArtistFromCachedLibrary({ accountId, plexState, request, artistId }) {
+    const normalizedArtistId = String(artistId || '').trim();
+    if (!normalizedArtistId) {
+      return null;
+    }
+
+    const [artists, albums, tracks] = await Promise.all([
+      getCachedLibraryArtists({ accountId, plexState, request }),
+      getCachedLibraryAlbums({ accountId, plexState, request }),
+      getCachedLibraryTracks({ accountId, plexState, request }),
+    ]);
+
+    const cachedArtist = artists.find((item) => String(item?.ratingKey || '').trim() === normalizedArtistId) || null;
+    const cachedAlbums = albums.filter((item) => String(item?.parentRatingKey || '').trim() === normalizedArtistId);
+    const artistTracks = tracks.filter((item) => String(item?.grandparentRatingKey || '').trim() === normalizedArtistId);
+
+    if (!cachedArtist && cachedAlbums.length === 0 && artistTracks.length === 0) {
+      return null;
+    }
+
+    const artistName = cachedArtist?.title ||
+      firstNonEmptyText(artistTracks.map((item) => item?.grandparentTitle), `Artist ${normalizedArtistId}`);
+
+    const artist = cachedArtist || {
+      ratingKey: normalizedArtistId,
+      title: artistName,
+      addedAt: artistTracks[0]?.addedAt,
+      updatedAt: artistTracks[0]?.updatedAt,
+    };
+
+    const resolvedAlbums = cachedAlbums.length > 0
+      ? cachedAlbums
+      : deriveAlbumsFromTracks(artistTracks, normalizedArtistId, artistName);
+
+    return {
+      artist,
+      albums: resolvedAlbums,
+    };
   }
 
   function scanStatusAttrsFromSection(section, { fallbackScanning = false } = {}) {
@@ -4117,7 +4192,8 @@ export async function buildServer(config = loadConfig()) {
         );
 
         const sortedSongs = sortTracksForLibraryBrowse(matchedSongs);
-        const page = takePage(sortedSongs, offset, count);
+        const page = takePage(sortedSongs, offset, count)
+          .map((track) => withResolvedTrackGenres(track, albumGenreTagMap));
         const songXml = page.map((track) => emptyNode('song', songAttrs(track))).join('');
         return sendSubsonicOk(reply, node('songsByGenre', {}, songXml));
       } catch (error) {
@@ -4381,13 +4457,32 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const track = await getTrack({
+      let track = await getTrack({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
         trackId: id,
       });
       if (!track) {
         return sendSubsonicError(reply, 70, 'Song not found');
+      }
+
+      if (!firstGenreTag(track)) {
+        const albumId = String(track?.parentRatingKey || '').trim();
+        if (albumId) {
+          try {
+            const album = await getAlbum({
+              baseUrl: plexState.baseUrl,
+              plexToken: plexState.plexToken,
+              albumId,
+            });
+            if (album) {
+              const albumGenreTagMap = buildAlbumGenreTagMap([album]);
+              track = withResolvedTrackGenres(track, albumGenreTagMap);
+            }
+          } catch (error) {
+            request.log.debug(error, 'Failed to enrich song genre from album metadata');
+          }
+        }
       }
       applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [track] });
 
@@ -5695,32 +5790,51 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const artist = await getArtist({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        artistId,
-      });
+      let artist = null;
+      let finalAlbums = [];
 
-      if (!artist) {
-        return sendSubsonicError(reply, 70, 'Artist not found');
-      }
-      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [artist] });
-
-      const albums = await listArtistAlbums({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        artistId,
-      });
-      applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: albums });
-
-      let finalAlbums = albums;
-      if (finalAlbums.length === 0) {
-        const tracks = await listArtistTracks({
+      try {
+        artist = await getArtist({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
           artistId,
         });
-        finalAlbums = deriveAlbumsFromTracks(tracks, artist.ratingKey, artist.title);
+      } catch (error) {
+        if (!isPlexNotFoundError(error)) {
+          throw error;
+        }
+      }
+
+      if (artist) {
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [artist] });
+        const albums = await listArtistAlbums({
+          baseUrl: plexState.baseUrl,
+          plexToken: plexState.plexToken,
+          artistId,
+        });
+        applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: albums });
+        finalAlbums = albums;
+        if (finalAlbums.length === 0) {
+          const tracks = await listArtistTracks({
+            baseUrl: plexState.baseUrl,
+            plexToken: plexState.plexToken,
+            artistId,
+          });
+          applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
+          finalAlbums = deriveAlbumsFromTracks(tracks, artist.ratingKey, artist.title);
+        }
+      } else {
+        const fallback = await resolveArtistFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          artistId,
+        });
+        if (!fallback?.artist) {
+          return sendSubsonicError(reply, 70, 'Artist not found');
+        }
+        artist = fallback.artist;
+        finalAlbums = fallback.albums || [];
       }
 
       const albumXml = finalAlbums
@@ -5926,11 +6040,18 @@ export async function buildServer(config = loadConfig()) {
         );
       }
 
-      const artist = await getArtist({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        artistId: id,
-      });
+      let artist = null;
+      try {
+        artist = await getArtist({
+          baseUrl: plexState.baseUrl,
+          plexToken: plexState.plexToken,
+          artistId: id,
+        });
+      } catch (error) {
+        if (!isPlexNotFoundError(error)) {
+          throw error;
+        }
+      }
 
       if (artist) {
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [artist] });
@@ -5967,6 +6088,34 @@ export async function buildServer(config = loadConfig()) {
             children,
           ),
         );
+      }
+
+      if (!artist) {
+        const fallback = await resolveArtistFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          artistId: id,
+        });
+        if (fallback?.artist) {
+          const fallbackAlbums = fallback.albums || [];
+          const children = fallbackAlbums
+            .map((album) => emptyNode('child', albumAttrs(album, fallback.artist.ratingKey, fallback.artist.title)))
+            .join('');
+
+          return sendSubsonicOk(
+            reply,
+            node(
+              'directory',
+              {
+                id: fallback.artist.ratingKey,
+                parent: rootDirectoryId,
+                name: fallback.artist.title,
+              },
+              children,
+            ),
+          );
+        }
       }
 
       const album = await getAlbum({

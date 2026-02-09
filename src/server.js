@@ -69,6 +69,7 @@ import {
   searchSectionHubs,
   searchSectionMetadata,
   scrobblePlexItem,
+  startPlexSectionScan,
   updatePlexPlaybackStatus,
 } from './plex.js';
 import { createTokenCipher } from './token-crypto.js';
@@ -2867,6 +2868,22 @@ export async function buildServer(config = loadConfig()) {
     return applyRatingOverridesToItems(entry, items, Date.now());
   }
 
+  function scanStatusAttrsFromSection(section, { fallbackScanning = false } = {}) {
+    return {
+      scanning: Boolean(section?.scanning ?? fallbackScanning),
+      count: parseNonNegativeInt(section?.leafCount, 0),
+    };
+  }
+
+  async function getMusicSectionScanStatus(plexState) {
+    const sections = await listMusicSections({
+      baseUrl: plexState.baseUrl,
+      plexToken: plexState.plexToken,
+    });
+    const section = sections.find((item) => String(item?.id || '') === String(plexState.musicSectionId || ''));
+    return section || null;
+  }
+
   function beginSearchRequest(request, accountId) {
     const clientName =
       getRequestParam(request, 'c') ||
@@ -3848,13 +3865,22 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(
-      reply,
-      emptyNode('scanStatus', {
-        scanning: false,
-        count: 0,
-      }),
-    );
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      const section = await getMusicSectionScanStatus(plexState);
+      return sendSubsonicOk(
+        reply,
+        emptyNode('scanStatus', scanStatusAttrsFromSection(section)),
+      );
+    } catch (error) {
+      request.log.error(error, 'Failed to load scan status from Plex');
+      return sendSubsonicError(reply, 10, 'Failed to load scan status');
+    }
   });
 
   app.get('/rest/startScan.view', async (request, reply) => {
@@ -3863,13 +3889,31 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(
-      reply,
-      emptyNode('scanStatus', {
-        scanning: false,
-        count: 0,
-      }),
-    );
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      await startPlexSectionScan({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+        sectionId: plexState.musicSectionId,
+        force: true,
+      });
+
+      markSearchBrowseCacheDirty(searchBrowseCacheKey(account.id, plexState));
+
+      const section = await getMusicSectionScanStatus(plexState);
+      return sendSubsonicOk(
+        reply,
+        emptyNode('scanStatus', scanStatusAttrsFromSection(section, { fallbackScanning: true })),
+      );
+    } catch (error) {
+      request.log.error(error, 'Failed to trigger Plex scan');
+      return sendSubsonicError(reply, 10, 'Failed to trigger scan');
+    }
   });
 
   app.get('/rest/getStarred.view', async (request, reply) => {

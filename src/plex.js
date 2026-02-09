@@ -208,6 +208,7 @@ function normalizeLibrarySection(section) {
     id: String(section.key ?? section.id ?? ''),
     title: section.title || section.name || 'Untitled',
     type: section.type || '',
+    scanning: toBool(section.refreshing) || toBool(section.scanning),
     updatedAt: parseTimestamp(section.updatedAt),
     scannedAt: parseTimestamp(section.scannedAt),
     refreshedAt: parseTimestamp(section.refreshedAt),
@@ -627,6 +628,20 @@ export async function listMusicSections({ baseUrl, plexToken }) {
     .map(normalizeLibrarySection)
     .filter((section) => section.id)
     .filter((section) => section.type === 'artist' || section.type === 'music');
+}
+
+export async function startPlexSectionScan({ baseUrl, plexToken, sectionId, force = true }) {
+  await fetchPms(
+    baseUrl,
+    plexToken,
+    `/library/sections/${encodeURIComponent(sectionId)}/refresh`,
+    {
+      method: 'GET',
+      searchParams: {
+        force: force ? 1 : 0,
+      },
+    },
+  );
 }
 
 export async function listPlexSectionFolder({ baseUrl, plexToken, sectionId, folderPath = null }) {

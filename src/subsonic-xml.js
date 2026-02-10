@@ -207,6 +207,8 @@ const ARRAY_CHILDREN_BY_PARENT = {
   playlists: new Set(['playlist']),
   directory: new Set(['child']),
   playlist: new Set(['entry']),
+  playQueue: new Set(['entry']),
+  nowPlaying: new Set(['entry']),
   lyricsList: new Set(['structuredLyrics']),
   structuredLyrics: new Set(['line']),
   starred: new Set(['artist', 'album', 'song']),

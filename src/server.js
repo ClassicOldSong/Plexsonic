@@ -2288,11 +2288,13 @@ export async function buildServer(config = loadConfig()) {
   });
 
   const playbackSessions = new Map();
+  const savedPlayQueues = new Map();
   const PLAYBACK_RECONCILE_INTERVAL_MS = 15000;
   const PLAYBACK_IDLE_TIMEOUT_MS = 120000;
   const STREAM_DISCONNECT_STOP_DELAY_MS = 4000;
   const PLAYBACK_MAX_DISCONNECT_WAIT_MS = 30 * 60 * 1000;
   const STREAM_PROGRESS_HEARTBEAT_MS = 10000;
+  const PLAY_QUEUE_IDLE_TTL_MS = 6 * 60 * 60 * 1000;
   const activeSearchRequests = new Map();
   const searchBrowseCache = new Map();
   const SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS = 15000;
@@ -2890,6 +2892,90 @@ export async function buildServer(config = loadConfig()) {
       request,
       loader: () => loadLibraryTracksRaw({ plexState }),
     });
+  }
+
+  function pruneSavedPlayQueues(now = Date.now()) {
+    for (const [key, value] of savedPlayQueues.entries()) {
+      if (!value || (now - Number(value.updatedAt || 0)) > PLAY_QUEUE_IDLE_TTL_MS) {
+        savedPlayQueues.delete(key);
+      }
+    }
+  }
+
+  function playQueueClientKey(request) {
+    const rawClient =
+      getRequestParam(request, 'c') ||
+      String(request.headers?.['user-agent'] || '').trim() ||
+      'subsonic-client';
+    return safeLower(rawClient).slice(0, 128) || 'subsonic-client';
+  }
+
+  function playQueueStorageKey(accountId, request) {
+    return `${accountId}:${playQueueClientKey(request)}`;
+  }
+
+  function requestedPlayQueueItemIds(request) {
+    const ids = getRequestParamValues(request, 'id');
+    if (ids.length > 0) {
+      return ids;
+    }
+    return getRequestParamValues(request, 'songId');
+  }
+
+  async function resolveTracksByIdOrder({ accountId, plexState, request, ids }) {
+    const orderedIds = (Array.isArray(ids) ? ids : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean);
+    if (orderedIds.length === 0) {
+      return [];
+    }
+
+    const tracks = await getCachedLibraryTracks({ accountId, plexState, request });
+    const cachedById = new Map();
+    for (const track of tracks) {
+      const ratingKey = String(track?.ratingKey || '').trim();
+      if (ratingKey && !cachedById.has(ratingKey)) {
+        cachedById.set(ratingKey, track);
+      }
+    }
+
+    const missingIds = [];
+    for (const id of orderedIds) {
+      if (!cachedById.has(id)) {
+        missingIds.push(id);
+      }
+    }
+
+    if (missingIds.length > 0) {
+      const fetched = await Promise.all(
+        missingIds.map(async (trackId) => {
+          try {
+            const track = await getTrack({
+              baseUrl: plexState.baseUrl,
+              plexToken: plexState.plexToken,
+              trackId,
+            });
+            return track || null;
+          } catch {
+            return null;
+          }
+        }),
+      );
+
+      const nonNullFetched = fetched.filter(Boolean);
+      applyCachedRatingOverridesForAccount({ accountId, plexState, items: nonNullFetched });
+
+      for (const track of nonNullFetched) {
+        const ratingKey = String(track?.ratingKey || '').trim();
+        if (ratingKey && !cachedById.has(ratingKey)) {
+          cachedById.set(ratingKey, track);
+        }
+      }
+    }
+
+    return orderedIds
+      .map((id) => cachedById.get(id))
+      .filter(Boolean);
   }
 
   function applyCachedRatingOverridesForAccount({ accountId, plexState, items }) {
@@ -3939,7 +4025,67 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, node('nowPlaying'));
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      const sessions = [...playbackSessions.values()]
+        .filter((session) =>
+          session &&
+          session.accountId === account.id &&
+          session.itemId &&
+          session.state !== 'stopped',
+        )
+        .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+
+      if (sessions.length === 0) {
+        return sendSubsonicOk(reply, node('nowPlaying'));
+      }
+
+      const dedupedByItemId = new Map();
+      for (const session of sessions) {
+        const itemId = String(session.itemId || '').trim();
+        if (itemId && !dedupedByItemId.has(itemId)) {
+          dedupedByItemId.set(itemId, session);
+        }
+      }
+
+      const itemIds = [...dedupedByItemId.keys()];
+      const tracks = await resolveTracksByIdOrder({
+        accountId: account.id,
+        plexState,
+        request,
+        ids: itemIds,
+      });
+
+      const sessionByTrackId = new Map(
+        [...dedupedByItemId.entries()].map(([id, session]) => [id, session]),
+      );
+      const entries = tracks
+        .map((track) => {
+          const trackId = String(track?.ratingKey || '').trim();
+          const session = sessionByTrackId.get(trackId);
+          const minutesAgo = Math.max(
+            0,
+            Math.floor((Date.now() - Number(session?.updatedAt || Date.now())) / 60000),
+          );
+          return emptyNode('entry', {
+            ...songAttrs(track),
+            username: account.username,
+            playerId: session?.clientIdentifier || undefined,
+            minutesAgo,
+          });
+        })
+        .join('');
+
+      return sendSubsonicOk(reply, node('nowPlaying', {}, entries));
+    } catch (error) {
+      request.log.error(error, 'Failed to load now playing entries');
+      return sendSubsonicError(reply, 10, 'Failed to load now playing');
+    }
   });
 
   app.get('/rest/getScanStatus.view', async (request, reply) => {
@@ -5057,17 +5203,54 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(
-      reply,
-      node(
-        'playQueue',
-        {
-          current: '',
-          position: 0,
-        },
-        '',
-      ),
-    );
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    pruneSavedPlayQueues();
+    const queueKey = playQueueStorageKey(account.id, request);
+    const queueState = savedPlayQueues.get(queueKey) || {
+      ids: [],
+      current: '',
+      position: 0,
+      updatedAt: Date.now(),
+    };
+
+    try {
+      const effectiveIds = queueState.current && !queueState.ids.includes(queueState.current)
+        ? [queueState.current, ...queueState.ids]
+        : queueState.ids;
+      const tracks = await resolveTracksByIdOrder({
+        accountId: account.id,
+        plexState,
+        request,
+        ids: effectiveIds,
+      });
+
+      const entries = tracks
+        .map((track) => emptyNode('entry', songAttrs(track)))
+        .join('');
+      const changedIso = new Date(Number(queueState.updatedAt || Date.now())).toISOString();
+
+      return sendSubsonicOk(
+        reply,
+        node(
+          'playQueue',
+          {
+            current: queueState.current || '',
+            position: parseNonNegativeInt(queueState.position, 0),
+            username: account.username,
+            changed: changedIso,
+          },
+          entries,
+        ),
+      );
+    } catch (error) {
+      request.log.error(error, 'Failed to load saved play queue');
+      return sendSubsonicError(reply, 10, 'Failed to load play queue');
+    }
   });
 
   app.get('/rest/savePlayQueue.view', async (request, reply) => {
@@ -5075,6 +5258,21 @@ export async function buildServer(config = loadConfig()) {
     if (!account) {
       return;
     }
+
+    const ids = requestedPlayQueueItemIds(request);
+    const explicitCurrent = String(getRequestParam(request, 'current') || '').trim();
+    const current = explicitCurrent || ids[0] || '';
+    const position = parseNonNegativeInt(getRequestParam(request, 'position'), 0);
+    const queueKey = playQueueStorageKey(account.id, request);
+    const now = Date.now();
+
+    savedPlayQueues.set(queueKey, {
+      ids,
+      current,
+      position,
+      updatedAt: now,
+    });
+    pruneSavedPlayQueues(now);
 
     return sendSubsonicOk(reply);
   });

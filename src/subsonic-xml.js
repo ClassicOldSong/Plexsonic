@@ -321,6 +321,11 @@ function nodeToJson(node) {
     }
   }
 
+  const keys = Object.keys(out);
+  if (keys.length === 1 && keys[0] === 'value') {
+    return out.value;
+  }
+
   if (node.name === 'openSubsonicExtensions') {
     const extensions = out.openSubsonicExtension;
     if (Array.isArray(extensions)) {

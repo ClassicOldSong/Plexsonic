@@ -1,6 +1,6 @@
 {
   "name": "plexsonic",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "description": "PlexMusic to OpenSubsonic bridge",
   "main": "./src/index.js",
   "bin": {

@@ -868,6 +868,111 @@ function isPlexLiked(value) {
   return normalized != null && normalized >= 2 && normalized % 2 === 0;
 }
 
+function normalizePlainText(value) {
+  return String(value || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function asArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (value == null) {
+    return [];
+  }
+  return [value];
+}
+
+function plexGuidIds(item) {
+  const candidates = [];
+
+  for (const guid of asArray(item?.Guid)) {
+    if (typeof guid === 'string') {
+      candidates.push(guid);
+      continue;
+    }
+    if (guid && typeof guid === 'object' && typeof guid.id === 'string') {
+      candidates.push(guid.id);
+    }
+  }
+
+  for (const raw of [item?.guid, item?.guids]) {
+    if (typeof raw === 'string') {
+      candidates.push(raw);
+    } else if (Array.isArray(raw)) {
+      for (const entry of raw) {
+        if (typeof entry === 'string') {
+          candidates.push(entry);
+        } else if (entry && typeof entry === 'object' && typeof entry.id === 'string') {
+          candidates.push(entry.id);
+        }
+      }
+    }
+  }
+
+  return uniqueNonEmptyValues(candidates);
+}
+
+function extractMusicBrainzArtistId(item) {
+  const guidIds = plexGuidIds(item);
+  const uuidPattern = /([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/i;
+
+  for (const guid of guidIds) {
+    const lower = safeLower(guid);
+
+    if (lower.startsWith('mbid://')) {
+      const id = guid.slice('mbid://'.length).split(/[/?#]/, 1)[0].trim();
+      if (id) {
+        return id;
+      }
+    }
+
+    if (lower.startsWith('musicbrainz://')) {
+      const id = guid
+        .slice('musicbrainz://'.length)
+        .replace(/^artist\//i, '')
+        .split(/[?#]/, 1)[0]
+        .replace(/^\/+/, '')
+        .trim();
+      if (id) {
+        return id;
+      }
+    }
+
+    if (lower.includes('musicbrainz.org/artist/')) {
+      const match = guid.match(/musicbrainz\.org\/artist\/([^/?#]+)/i);
+      if (match?.[1]) {
+        return match[1];
+      }
+    }
+
+    if (lower.includes('musicbrainz')) {
+      const uuid = guid.match(uuidPattern)?.[1];
+      if (uuid) {
+        return uuid;
+      }
+    }
+  }
+
+  return '';
+}
+
+function artistBioFromPlex(item) {
+  return firstNonEmptyText(
+    [
+      normalizePlainText(item?.summary),
+      normalizePlainText(item?.tagline),
+      normalizePlainText(item?.description),
+    ],
+    '',
+  );
+}
+
 function subsonicRatingToPlexRating(value, { liked = false } = {}) {
   const rating = Number.parseInt(String(value ?? ''), 10);
   if (!Number.isFinite(rating) || rating <= 0) {
@@ -6131,7 +6236,61 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, node('artistInfo'));
+    const artistId = String(getRequestParam(request, 'id') || '').trim();
+    if (!artistId) {
+      return sendSubsonicError(reply, 70, 'Missing artist id');
+    }
+
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      let artist = null;
+      try {
+        artist = await getArtist({
+          baseUrl: plexState.baseUrl,
+          plexToken: plexState.plexToken,
+          artistId,
+        });
+      } catch (error) {
+        if (!isPlexNotFoundError(error)) {
+          throw error;
+        }
+      }
+
+      if (!artist) {
+        const fallback = await resolveArtistFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          artistId,
+        });
+        if (fallback?.artist) {
+          artist = fallback.artist;
+        }
+      }
+
+      if (!artist) {
+        return sendSubsonicError(reply, 70, 'Artist not found');
+      }
+
+      const biography = artistBioFromPlex(artist);
+      const musicBrainzId = extractMusicBrainzArtistId(artist);
+      const children = [
+        biography ? node('biography', {}, biography) : '',
+        musicBrainzId ? node('musicBrainzId', {}, musicBrainzId) : '',
+      ]
+        .filter(Boolean)
+        .join('');
+
+      return sendSubsonicOk(reply, node('artistInfo', {}, children));
+    } catch (error) {
+      request.log.error(error, 'Failed to load artist info');
+      return sendSubsonicError(reply, 10, 'Failed to load artist info');
+    }
   });
 
   app.get('/rest/getArtistInfo2.view', async (request, reply) => {
@@ -6140,7 +6299,61 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, node('artistInfo2'));
+    const artistId = String(getRequestParam(request, 'id') || '').trim();
+    if (!artistId) {
+      return sendSubsonicError(reply, 70, 'Missing artist id');
+    }
+
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      let artist = null;
+      try {
+        artist = await getArtist({
+          baseUrl: plexState.baseUrl,
+          plexToken: plexState.plexToken,
+          artistId,
+        });
+      } catch (error) {
+        if (!isPlexNotFoundError(error)) {
+          throw error;
+        }
+      }
+
+      if (!artist) {
+        const fallback = await resolveArtistFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          artistId,
+        });
+        if (fallback?.artist) {
+          artist = fallback.artist;
+        }
+      }
+
+      if (!artist) {
+        return sendSubsonicError(reply, 70, 'Artist not found');
+      }
+
+      const biography = artistBioFromPlex(artist);
+      const musicBrainzId = extractMusicBrainzArtistId(artist);
+      const children = [
+        biography ? node('biography', {}, biography) : '',
+        musicBrainzId ? node('musicBrainzId', {}, musicBrainzId) : '',
+      ]
+        .filter(Boolean)
+        .join('');
+
+      return sendSubsonicOk(reply, node('artistInfo2', {}, children));
+    } catch (error) {
+      request.log.error(error, 'Failed to load artist info2');
+      return sendSubsonicError(reply, 10, 'Failed to load artist info');
+    }
   });
 
   app.get('/rest/getAlbum.view', async (request, reply) => {

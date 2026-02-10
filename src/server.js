@@ -2120,6 +2120,7 @@ function requiredPlexStateForSubsonic(reply, plexContext, tokenCipher) {
     baseUrl: plexContext.server_base_url,
     machineId: plexContext.machine_id,
     musicSectionId: plexContext.music_section_id,
+    musicSectionName: plexContext.music_section_name || null,
     serverName: plexContext.server_name || 'Plex Music',
   };
 }
@@ -3889,10 +3890,17 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
+    const rawSectionId = String(plexState.musicSectionId || '').trim();
+    const musicFolderId = /^\d+$/.test(rawSectionId) ? Number(rawSectionId) : rawSectionId;
+    const musicFolderName =
+      String(plexState.musicSectionName || '').trim() ||
+      String(plexState.serverName || '').trim() ||
+      'Music';
+
     const inner = node(
       'musicFolders',
       {},
-      emptyNode('musicFolder', { id: plexState.musicSectionId, name: plexState.serverName }),
+      emptyNode('musicFolder', { id: musicFolderId, name: musicFolderName }),
     );
     return sendSubsonicOk(reply, inner);
   });

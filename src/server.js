@@ -1694,6 +1694,64 @@ function isAbortError(error) {
   return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 }
 
+const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function waitMs(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchWithRetry({
+  url,
+  options = {},
+  request = null,
+  context = 'upstream request',
+  maxAttempts = 3,
+  baseDelayMs = 200,
+}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (!RETRYABLE_UPSTREAM_STATUSES.has(response.status) || attempt >= maxAttempts) {
+        return response;
+      }
+
+      request?.log?.warn(
+        { context, status: response.status, attempt, maxAttempts },
+        'Transient upstream failure, retrying',
+      );
+
+      try {
+        await response.body?.cancel?.();
+      } catch {}
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
+
+      request?.log?.warn(
+        { context, attempt, maxAttempts, message: error?.message || String(error) },
+        'Transient upstream error, retrying',
+      );
+    }
+
+    await waitMs(baseDelayMs * attempt);
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  throw new Error(`${context} failed after retries`);
+}
+
 function isPlexNotFoundError(error) {
   return String(error?.message || '').includes('(404)');
 }
@@ -6742,10 +6800,17 @@ export async function buildServer(config = loadConfig()) {
 
       const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
       const rangeHeader = request.headers.range;
-      const upstream = await fetch(streamUrl, {
-        headers: {
-          ...(rangeHeader ? { Range: rangeHeader } : {}),
+      const upstream = await fetchWithRetry({
+        url: streamUrl,
+        options: {
+          headers: {
+            ...(rangeHeader ? { Range: rangeHeader } : {}),
+          },
         },
+        request,
+        context: 'track stream proxy',
+        maxAttempts: 3,
+        baseDelayMs: 250,
       });
 
       if (!upstream.ok || !upstream.body) {

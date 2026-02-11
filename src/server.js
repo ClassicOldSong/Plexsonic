@@ -3491,6 +3491,49 @@ export async function buildServer(config = loadConfig()) {
     });
   }
 
+  function updatePlaybackSessionEstimateFromStream({
+    accountId,
+    clientName,
+    trackId,
+    durationMs = null,
+    positionMs = 0,
+  }) {
+    const playbackClient = playbackClientContext(accountId, clientName);
+    const current = playbackSessions.get(playbackClient.sessionKey);
+    if (!current || current.state !== 'playing') {
+      return false;
+    }
+
+    const normalizedTrackId = String(trackId || '').trim();
+    if (!normalizedTrackId || String(current.itemId || '').trim() !== normalizedTrackId) {
+      return false;
+    }
+
+    const now = Date.now();
+    const normalizedDuration = Number.isFinite(durationMs) && durationMs > 0
+      ? Math.max(0, Math.trunc(durationMs))
+      : Number.isFinite(current.durationMs) && current.durationMs > 0
+        ? Math.max(0, Math.trunc(current.durationMs))
+        : null;
+    const normalizedPosition = Number.isFinite(positionMs) && positionMs >= 0
+      ? Math.max(0, Math.trunc(positionMs))
+      : 0;
+    const basePosition = Math.max(Number(current.positionMs || 0), normalizedPosition);
+    const estimatedStopAt = normalizedDuration != null
+      ? now + Math.max(0, normalizedDuration - basePosition)
+      : current.estimatedStopAt;
+
+    playbackSessions.set(playbackClient.sessionKey, {
+      ...current,
+      durationMs: normalizedDuration,
+      positionMs: basePosition,
+      estimatedStopAt,
+      updatedAt: now,
+    });
+
+    return true;
+  }
+
   const playbackMaintenanceTimer = setInterval(async () => {
     const now = Date.now();
     const sessions = [...playbackSessions.entries()];
@@ -3501,8 +3544,16 @@ export async function buildServer(config = loadConfig()) {
         continue;
       }
 
-      if (now - Number(session.updatedAt || 0) > PLAYBACK_IDLE_TIMEOUT_MS) {
+      const estimatedStopReached = (
+        session.state === 'playing' &&
+        Number.isFinite(session.estimatedStopAt) &&
+        session.estimatedStopAt <= now
+      );
+      const idleExpired = now - Number(session.updatedAt || 0) > PLAYBACK_IDLE_TIMEOUT_MS;
+
+      if (estimatedStopReached || idleExpired) {
         if (
+          !estimatedStopReached &&
           session.state === 'playing' &&
           Number.isFinite(session.estimatedStopAt) &&
           session.estimatedStopAt > now
@@ -7079,6 +7130,16 @@ export async function buildServer(config = loadConfig()) {
       const offsetMs = Number.isFinite(offsetSeconds) && offsetSeconds > 0 ? Math.round(offsetSeconds * 1000) : 0;
       const trackDurationMs = parseNonNegativeInt(track.duration, 0);
       const playbackStartAt = Date.now();
+
+      if (streamPlaybackAuthorityDisabled) {
+        updatePlaybackSessionEstimateFromStream({
+          accountId: account.id,
+          clientName,
+          trackId,
+          durationMs: trackDurationMs > 0 ? trackDurationMs : null,
+          positionMs: offsetMs,
+        });
+      }
 
       const estimatePlaybackPositionMs = (nowMs = Date.now()) => {
         const elapsedMs = Math.max(0, nowMs - playbackStartAt);

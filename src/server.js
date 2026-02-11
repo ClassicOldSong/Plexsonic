@@ -777,6 +777,17 @@ function partFromTrack(track) {
   return Array.isArray(media?.Part) ? media.Part[0] : null;
 }
 
+function audioStreamFromTrack(track) {
+  const part = partFromTrack(track);
+  const streams = Array.isArray(part?.Stream) ? part.Stream : [];
+  if (streams.length === 0) {
+    return null;
+  }
+
+  const audioStream = streams.find((stream) => parseNonNegativeInt(stream?.streamType, -1) === 2);
+  return audioStream || streams[0] || null;
+}
+
 function detectAudioSuffix(track) {
   const media = mediaFromTrack(track);
   const container = String(media?.container || '').toLowerCase();
@@ -1138,6 +1149,7 @@ function deriveAlbumsFromTracks(tracks, fallbackArtistId, fallbackArtistName) {
 function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata = null) {
   const media = mediaFromTrack(track);
   const part = partFromTrack(track);
+  const audioStream = audioStreamFromTrack(track);
   const trackId = String(track?.ratingKey || '').trim();
   const albumId = firstNonEmptyText(
     [track?.parentRatingKey, typeof albumCoverArt === 'string' ? albumCoverArt : null],
@@ -1164,6 +1176,9 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
   const genreTags = genreTagsRaw.length > 0 ? genreTagsRaw : albumGenreTags;
   const genre = genreTags[0] || undefined;
   const genres = genreTags.length > 0 ? genreTags.join('; ') : undefined;
+  const styleValues = metadataFieldValues([track, albumMetadata], ['Style', 'style']);
+  const style = styleValues[0] || undefined;
+  const styles = styleValues.length > 0 ? styleValues.join('; ') : undefined;
   const discNumber = parsePositiveInt(track?.parentIndex ?? track?.discNumber, 0) || undefined;
   const discSubtitle = firstNonEmptyText(
     [track?.parentSubtitle, track?.discSubtitle, track?.parentOriginalTitle],
@@ -1177,19 +1192,45 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     undefined,
   );
   const country = metadataFieldText([track, albumMetadata], ['Country', 'country']);
-  const style = metadataFieldText([track, albumMetadata], ['Style', 'style']);
   const moodValues = metadataFieldValues([track, albumMetadata], ['Mood', 'mood']);
   const mood = moodValues[0] || undefined;
   const moods = moodValues.length > 0 ? moodValues.join('; ') : undefined;
+  const recordLabelValues = metadataFieldValues(
+    [track, albumMetadata],
+    ['RecordLabel', 'recordLabel', 'recordlabel', 'Label', 'label', 'Studio', 'studio'],
+  );
+  const recordLabel = recordLabelValues[0] || undefined;
+  const recordLabels = recordLabelValues.length > 0 ? recordLabelValues.join('; ') : undefined;
   const language =
     metadataFieldText([track, albumMetadata], ['Language', 'language', 'Lang', 'lang']) || streamLanguage;
   const albumType = metadataFieldText(
     [albumMetadata, track],
     ['albumType', 'AlbumType', 'subtype', 'subType', 'parentSubtype', 'format'],
   );
+  const compilationValues = metadataFieldValues(
+    [track, albumMetadata],
+    ['Compilation', 'compilation', 'isCompilation', 'iscompilation'],
+  );
+  const soundtrackValues = metadataFieldValues(
+    [track, albumMetadata],
+    ['Soundtrack', 'soundtrack', 'isSoundtrack', 'issoundtrack'],
+  );
+  const compilation = compilationValues.length > 0
+    ? parseBooleanLike(compilationValues[0], false)
+    : safeLower(albumType).includes('compilation');
+  const soundtrack = soundtrackValues.length > 0
+    ? parseBooleanLike(soundtrackValues[0], false)
+    : safeLower(albumType).includes('soundtrack');
+  const sampleRate = parsePositiveInt(
+    audioStream?.samplingRate ?? audioStream?.sampleRate ?? audioStream?.audioSamplingRate,
+    0,
+  ) || undefined;
+  const bitDepth = parsePositiveInt(audioStream?.bitDepth ?? audioStream?.bitsPerSample, 0) || undefined;
+  const path = firstNonEmptyText([part?.file], undefined);
   const trackNumber = parsePositiveInt(track?.index ?? track?.track, 0);
   const playCount = parseNonNegativeInt(track?.viewCount ?? track?.playCount, 0);
   const played = toIsoFromEpochSeconds(track?.lastViewedAt);
+  const year = parsePositiveInt(track?.year ?? track?.parentYear ?? albumMetadata?.year, 0) || undefined;
 
   return {
     id: trackId,
@@ -1210,16 +1251,24 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     suffix: detectAudioSuffix(track),
     size: part?.size,
     bitRate: media?.bitrate,
+    sampleRate,
+    bitDepth,
+    path,
     coverArt,
     genre,
     genres,
     country,
     style,
+    styles,
     mood,
     moods,
+    recordLabel,
+    recordLabels,
     language,
     albumType,
-    year: track.year,
+    compilation: compilation || undefined,
+    soundtrack: soundtrack || undefined,
+    year,
     played,
     created: toIsoFromEpochSeconds(track.addedAt),
     playCount: playCount || undefined,
@@ -1319,6 +1368,9 @@ async function hydrateTracksWithGenre({ baseUrl, plexToken, tracks, request = nu
         }
 
         const merged = { ...track };
+        if (!merged.Media && detailed?.Media) {
+          merged.Media = detailed.Media;
+        }
         if (Array.isArray(detailed?.Genre) && detailed.Genre.length > 0) {
           merged.Genre = detailed.Genre;
         }
@@ -1330,12 +1382,29 @@ async function hydrateTracksWithGenre({ baseUrl, plexToken, tracks, request = nu
           'country',
           'Style',
           'style',
+          'Compilation',
+          'compilation',
+          'isCompilation',
+          'iscompilation',
+          'Soundtrack',
+          'soundtrack',
+          'isSoundtrack',
+          'issoundtrack',
+          'RecordLabel',
+          'recordLabel',
+          'recordlabel',
+          'Label',
+          'label',
+          'Studio',
+          'studio',
           'Mood',
           'mood',
           'Language',
           'language',
           'Lang',
           'lang',
+          'year',
+          'parentYear',
           'albumType',
           'AlbumType',
           'parentSubtype',

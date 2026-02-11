@@ -161,6 +161,8 @@ const NUMERIC_ATTRS = new Set([
   'position',
   'lastModified',
   'start',
+  'sampleRate',
+  'bitDepth',
 ]);
 
 const BOOLEAN_ATTRS = new Set([
@@ -185,6 +187,8 @@ const BOOLEAN_ATTRS = new Set([
   'smart',
   'synced',
   'readonly',
+  'compilation',
+  'soundtrack',
 ]);
 
 const ARRAY_CHILDREN_BY_PARENT = {
@@ -220,46 +224,34 @@ function shouldUseArray(parentName, childName) {
 }
 
 function coerceAttrValue(key, value) {
-  if (key === 'genres') {
-    const genreNames = (() => {
-      if (Array.isArray(value)) {
-        return value
-          .flatMap((entry) => {
-            if (entry == null) {
-              return [];
-            }
-            if (typeof entry === 'string') {
-              return [entry];
-            }
-            if (typeof entry === 'object') {
-              return [String(entry.name || entry.tag || entry.value || entry.title || '').trim()];
-            }
-            return [String(entry).trim()];
-          })
-          .filter(Boolean);
-      }
-
-      const raw = String(value || '').trim();
-      if (!raw) {
-        return [];
-      }
-      const parts = raw.includes(';') ? raw.split(';') : raw.split(',');
-      return parts.map((part) => part.trim()).filter(Boolean);
-    })();
-
-    return genreNames.map((name) => ({ name }));
-  }
-
-  if (key === 'moods') {
-    if (Array.isArray(value)) {
-      return value.map((entry) => String(entry || '').trim()).filter(Boolean);
+  const splitList = (rawValue) => {
+    if (Array.isArray(rawValue)) {
+      return rawValue.map((entry) => String(entry || '').trim()).filter(Boolean);
     }
-    const raw = String(value || '').trim();
+    const raw = String(rawValue || '').trim();
     if (!raw) {
       return [];
     }
     const parts = raw.includes(';') ? raw.split(';') : raw.split(',');
     return parts.map((part) => part.trim()).filter(Boolean);
+  };
+
+  if (key === 'genres') {
+    const genreNames = splitList(value);
+    return genreNames.map((name) => ({ name }));
+  }
+
+  if (key === 'moods') {
+    return splitList(value);
+  }
+
+  if (key === 'styles') {
+    return splitList(value);
+  }
+
+  if (key === 'recordLabels') {
+    const labels = splitList(value);
+    return labels.map((name) => ({ name }));
   }
 
   if (BOOLEAN_ATTRS.has(key)) {

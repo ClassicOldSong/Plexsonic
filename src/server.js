@@ -19,7 +19,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import Fastify from 'fastify';
 import argon2 from 'argon2';
 import fastifyCookie from '@fastify/cookie';
@@ -1799,6 +1799,35 @@ function isAbortError(error) {
   return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 }
 
+function isUpstreamTerminationError(error) {
+  if (!error) {
+    return false;
+  }
+
+  const message = String(error?.message || '').toLowerCase();
+  const causeMessage = String(error?.cause?.message || '').toLowerCase();
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  const causeName = String(error?.cause?.name || '').toLowerCase();
+
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    message.includes('terminated') ||
+    message.includes('other side closed') ||
+    causeMessage.includes('other side closed') ||
+    causeName.includes('socketerror')
+  );
+}
+
+function isClientDisconnected(request, reply) {
+  return Boolean(
+    request?.raw?.aborted ||
+    request?.raw?.destroyed ||
+    reply?.raw?.destroyed ||
+    reply?.raw?.writableEnded,
+  );
+}
+
 const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
 function waitMs(ms) {
@@ -2451,12 +2480,16 @@ export async function buildServer(config = loadConfig()) {
   });
 
   const playbackSessions = new Map();
+  const recentScrobblesByClient = new Map();
   const savedPlayQueues = new Map();
   const PLAYBACK_RECONCILE_INTERVAL_MS = 15000;
   const PLAYBACK_IDLE_TIMEOUT_MS = 120000;
   const STREAM_DISCONNECT_STOP_DELAY_MS = 4000;
   const PLAYBACK_MAX_DISCONNECT_WAIT_MS = 30 * 60 * 1000;
   const STREAM_PROGRESS_HEARTBEAT_MS = 10000;
+  const STREAM_PRELOAD_SUPPRESS_AFTER_SCROBBLE_MS = 1500;
+  const STREAM_SUPPRESSED_PROMOTE_DELAY_MS = 1200;
+  const PLAYBACK_CONTINUITY_AFTER_SCROBBLE_MS = 15000;
   const PLAY_QUEUE_IDLE_TTL_MS = 6 * 60 * 60 * 1000;
   const activeSearchRequests = new Map();
   const searchBrowseCache = new Map();
@@ -3264,6 +3297,116 @@ export async function buildServer(config = loadConfig()) {
       sessionKey,
       sessionId,
     };
+  }
+
+  function pruneRecentScrobbles(now = Date.now()) {
+    void now;
+    for (const [key, value] of recentScrobblesByClient.entries()) {
+      if (!value) {
+        recentScrobblesByClient.delete(key);
+      }
+    }
+  }
+
+  function getPlaybackContinuityState(accountId, clientName) {
+    const playbackClient = playbackClientContext(accountId, clientName);
+    let state = recentScrobblesByClient.get(playbackClient.sessionKey);
+    if (!state) {
+      state = {
+        at: 0,
+        trackId: '',
+        queueCurrentId: '',
+        queueIds: [],
+      };
+      recentScrobblesByClient.set(playbackClient.sessionKey, state);
+    }
+    return { playbackClient, state };
+  }
+
+  function resolveQueuedNextTrackId(state, currentTrackId) {
+    const normalizedCurrent = String(currentTrackId || '').trim();
+    if (!normalizedCurrent) {
+      return '';
+    }
+
+    const queueIds = Array.isArray(state?.queueIds) ? state.queueIds : [];
+    if (queueIds.length === 0) {
+      return '';
+    }
+
+    const index = queueIds.findIndex((id) => String(id || '').trim() === normalizedCurrent);
+    if (index === -1) {
+      return '';
+    }
+    const next = String(queueIds[index + 1] || '').trim();
+    return next;
+  }
+
+  function notePlaybackQueueContext({ accountId, clientName, currentTrackId = '', queueIds = [] }) {
+    const { state } = getPlaybackContinuityState(accountId, clientName);
+    state.queueCurrentId = String(currentTrackId || '').trim();
+    state.queueIds = uniqueNonEmptyValues(Array.isArray(queueIds) ? queueIds : []);
+  }
+
+  function noteRecentScrobble({ accountId, clientName, trackId = '' }) {
+    const now = Date.now();
+    const { state } = getPlaybackContinuityState(accountId, clientName);
+    state.at = now;
+    state.trackId = String(trackId || '').trim();
+    pruneRecentScrobbles(now);
+  }
+
+  function shouldSuppressPlaybackSyncForStreamLoad({ accountId, clientName, trackId }) {
+    const now = Date.now();
+    pruneRecentScrobbles(now);
+
+    const { playbackClient, state: recent } = getPlaybackContinuityState(accountId, clientName);
+    const current = playbackSessions.get(playbackClient.sessionKey);
+
+    const normalizedTrackId = String(trackId || '').trim();
+    if (!normalizedTrackId) {
+      return false;
+    }
+
+    const currentTrackId = String(current?.itemId || '').trim();
+    if (current?.state === 'playing' && currentTrackId && normalizedTrackId === currentTrackId) {
+      return false;
+    }
+
+    const queuedCurrentId = String(recent.queueCurrentId || '').trim();
+    if (queuedCurrentId && queuedCurrentId === normalizedTrackId) {
+      return false;
+    }
+
+    const recentTrackId = String(recent.trackId || '').trim();
+    if (
+      recentTrackId &&
+      recentTrackId === currentTrackId &&
+      (now - Number(recent.at || 0)) <= PLAYBACK_CONTINUITY_AFTER_SCROBBLE_MS
+    ) {
+      const queuedNextTrackId = resolveQueuedNextTrackId(recent, recentTrackId);
+      if (queuedNextTrackId && queuedNextTrackId === normalizedTrackId) {
+        return false;
+      }
+    }
+
+    // No confirmed playback and no trusted continuity signal: treat stream load as preload.
+    if (!current || current.state !== 'playing') {
+      return true;
+    }
+
+    // Current track exists but stale: still require explicit continuity signal to avoid preload flashes.
+    if ((now - Number(current.updatedAt || 0)) > PLAYBACK_IDLE_TIMEOUT_MS) {
+      return true;
+    }
+
+    // Suppress short-lived preloads right after a scrobble signal.
+    if ((now - Number(recent.at || 0)) <= STREAM_PRELOAD_SUPPRESS_AFTER_SCROBBLE_MS) {
+      return true;
+    }
+
+    // Continuity mode: keep current track authoritative unless trusted signal allows switch.
+    return true;
   }
 
   async function syncClientPlaybackState({
@@ -5436,6 +5579,13 @@ export async function buildServer(config = loadConfig()) {
       updatedAt: now,
     });
     pruneSavedPlayQueues(now);
+    const clientName = getRequestParam(request, 'c') || 'Subsonic Client';
+    notePlaybackQueueContext({
+      accountId: account.id,
+      clientName,
+      currentTrackId: current,
+      queueIds: ids,
+    });
 
     return sendSubsonicOk(reply);
   });
@@ -5449,9 +5599,11 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const songIds = uniqueNonEmptyValues(getRequestParamValues(request, 'songId'));
+      const genericIds = uniqueNonEmptyValues(getRequestParamValues(request, 'id'));
       const ids = uniqueNonEmptyValues([
-        ...getRequestParamValues(request, 'id'),
-        ...getRequestParamValues(request, 'songId'),
+        ...songIds,
+        ...genericIds,
       ]);
 
       if (ids.length === 0) {
@@ -5482,43 +5634,113 @@ export async function buildServer(config = loadConfig()) {
           ? Math.round(parsedOffset * 1000)
           : 0;
       const clientName = getRequestParam(request, 'c') || 'Subsonic Client';
-      const primaryTrackId = ids[0] || '';
+      const primaryTrackId = firstNonEmptyText(
+        [
+          getRequestParam(request, 'songId'),
+          getRequestParam(request, 'id'),
+          songIds[0],
+          ids[0],
+        ],
+        '',
+      );
+      const submissionIds = shouldSubmit
+        ? uniqueNonEmptyValues([primaryTrackId, ...ids])
+        : [];
+      const isNowPlayingScrobble = !shouldSubmit;
       const shouldSyncPlayback =
         Boolean(primaryTrackId) &&
-        (!shouldSubmit || ids.length === 1 || hasExplicitState) &&
-        (hasPlaybackProgress || hasExplicitState);
+        (
+          hasPlaybackProgress ||
+          hasExplicitState ||
+          isNowPlayingScrobble
+        );
+      const playbackClient = playbackClientContext(account.id, clientName);
+
+      let playbackSyncPromise = null;
+      if (shouldSyncPlayback) {
+        playbackSyncPromise = syncClientPlaybackState({
+          accountId: account.id,
+          plexState,
+          clientName,
+          itemId: primaryTrackId,
+          state: playbackState,
+          positionMs: playbackPositionMs,
+          request,
+        }).catch((error) => {
+          request.log.warn(error, 'Failed to sync playback status to Plex');
+        });
+      }
 
       try {
-        if (shouldSubmit) {
-          await Promise.all(
-            ids.map((id) =>
-              scrobblePlexItem({
-                baseUrl: plexState.baseUrl,
-                plexToken: plexState.plexToken,
-                itemId: id,
-              }),
-            ),
-          );
+        if (submissionIds.length > 0) {
+          const [firstId, ...restIds] = submissionIds;
+          await scrobblePlexItem({
+            baseUrl: plexState.baseUrl,
+            plexToken: plexState.plexToken,
+            itemId: firstId,
+          });
+          if (restIds.length > 0) {
+            await Promise.all(
+              restIds.map((id) =>
+                scrobblePlexItem({
+                  baseUrl: plexState.baseUrl,
+                  plexToken: plexState.plexToken,
+                  itemId: id,
+                }),
+              ),
+            );
+          }
         }
       } catch (error) {
         request.log.error(error, 'Failed to sync scrobble to Plex');
         return sendSubsonicError(reply, 10, 'Failed to scrobble');
       }
 
-      try {
-        if (shouldSyncPlayback) {
-          await syncClientPlaybackState({
-            accountId: account.id,
-            plexState,
-            clientName,
-            itemId: primaryTrackId,
-            state: playbackState,
-            positionMs: playbackPositionMs,
-            request,
-          });
+      if (playbackSyncPromise) {
+        await playbackSyncPromise;
+      }
+
+      noteRecentScrobble({
+        accountId: account.id,
+        clientName,
+        trackId: primaryTrackId,
+      });
+
+      const allowQueuedPromotion =
+        shouldSubmit &&
+        Boolean(primaryTrackId) &&
+        (
+          (hasExplicitState && playbackState === 'stopped') ||
+          (hasPlaybackProgress && playbackPositionMs > 0)
+        );
+
+      if (allowQueuedPromotion) {
+        const continuity = recentScrobblesByClient.get(playbackClient.sessionKey);
+        const queuedNextTrackId = resolveQueuedNextTrackId(continuity, primaryTrackId);
+        if (queuedNextTrackId) {
+          const current = playbackSessions.get(playbackClient.sessionKey);
+          const currentTrackId = String(current?.itemId || '').trim();
+          const shouldPromoteQueuedNext =
+            !current ||
+            current.state !== 'playing' ||
+            currentTrackId === primaryTrackId;
+
+          if (shouldPromoteQueuedNext) {
+            try {
+              await syncClientPlaybackState({
+                accountId: account.id,
+                plexState,
+                clientName,
+                itemId: queuedNextTrackId,
+                state: 'playing',
+                positionMs: 0,
+                request,
+              });
+            } catch (error) {
+              request.log.warn(error, 'Failed to promote queued next track after scrobble');
+            }
+          }
         }
-      } catch (error) {
-        request.log.warn(error, 'Failed to sync playback status to Plex');
       }
 
       return sendSubsonicOk(reply);
@@ -6845,6 +7067,13 @@ export async function buildServer(config = loadConfig()) {
 
       const clientName = getRequestParam(request, 'c') || 'Subsonic Client';
       const playbackClient = playbackClientContext(account.id, clientName);
+      const { state: continuityState } = getPlaybackContinuityState(account.id, clientName);
+      const streamPlaybackAuthorityDisabled = Number(continuityState.at || 0) > 0;
+      const suppressStreamLoadPlaybackSync = shouldSuppressPlaybackSyncForStreamLoad({
+        accountId: account.id,
+        clientName,
+        trackId,
+      }) || streamPlaybackAuthorityDisabled;
       const offsetRaw = getRequestParam(request, 'timeOffset');
       const offsetSeconds = Number.parseFloat(offsetRaw);
       const offsetMs = Number.isFinite(offsetSeconds) && offsetSeconds > 0 ? Math.round(offsetSeconds * 1000) : 0;
@@ -6868,23 +7097,71 @@ export async function buildServer(config = loadConfig()) {
           progressTimer = null;
         }
       };
-
-      try {
-        await syncClientPlaybackState({
-          accountId: account.id,
-          plexState,
-          clientName,
-          itemId: trackId,
-          state: 'playing',
-          positionMs: offsetMs,
-          durationMs: trackDurationMs,
-          request,
-        });
-      } catch (error) {
-        request.log.warn(error, 'Failed to sync stream-start playback status to Plex');
-      }
-
       let streamClosed = false;
+      let streamTrackingStarted = false;
+      let suppressedPromoteTimer = null;
+      const clearSuppressedPromoteTimer = () => {
+        if (suppressedPromoteTimer) {
+          clearTimeout(suppressedPromoteTimer);
+          suppressedPromoteTimer = null;
+        }
+      };
+
+      const startStreamPlaybackTracking = async (positionMs) => {
+        if (streamTrackingStarted || streamClosed) {
+          return;
+        }
+        streamTrackingStarted = true;
+
+        try {
+          await syncClientPlaybackState({
+            accountId: account.id,
+            plexState,
+            clientName,
+            itemId: trackId,
+            state: 'playing',
+            positionMs,
+            durationMs: trackDurationMs,
+            request,
+          });
+        } catch (error) {
+          request.log.warn(error, 'Failed to sync stream-start playback status to Plex');
+        }
+
+        progressTimer = setInterval(async () => {
+          if (progressSyncInFlight) {
+            return;
+          }
+
+          const current = playbackSessions.get(playbackClient.sessionKey);
+          if (!current || current.itemId !== String(trackId) || current.state !== 'playing') {
+            return;
+          }
+
+          progressSyncInFlight = true;
+          try {
+            await syncClientPlaybackState({
+              accountId: account.id,
+              plexState,
+              clientName,
+              itemId: trackId,
+              state: 'playing',
+              positionMs: estimatePlaybackPositionMs(),
+              durationMs: trackDurationMs,
+              request,
+            });
+          } catch (error) {
+            request.log.warn(error, 'Failed to sync stream progress playback status to Plex');
+          } finally {
+            progressSyncInFlight = false;
+          }
+        }, STREAM_PROGRESS_HEARTBEAT_MS);
+
+        if (typeof progressTimer.unref === 'function') {
+          progressTimer.unref();
+        }
+      };
+
       const handleStreamClosed = () => {
         if (streamClosed) {
           return;
@@ -6893,6 +7170,7 @@ export async function buildServer(config = loadConfig()) {
 
         const closedAt = Date.now();
         clearProgressTimer();
+        clearSuppressedPromoteTimer();
         const estimatedAtClose = estimatePlaybackPositionMs(closedAt);
         let currentAtClose = playbackSessions.get(playbackClient.sessionKey);
         if (currentAtClose && currentAtClose.itemId === String(trackId) && currentAtClose.state === 'playing') {
@@ -6974,51 +7252,71 @@ export async function buildServer(config = loadConfig()) {
           timer.unref();
         }
       };
+      if (!streamPlaybackAuthorityDisabled) {
+        reply.raw.once('close', handleStreamClosed);
+        reply.raw.once('finish', handleStreamClosed);
+      }
 
-      reply.raw.once('close', handleStreamClosed);
-      reply.raw.once('finish', handleStreamClosed);
+      if (suppressStreamLoadPlaybackSync) {
+        request.log.debug(
+          { trackId, clientName, streamPlaybackAuthorityDisabled },
+          'Suppressing immediate stream-start playback sync; awaiting continuity/persistence',
+        );
 
-      progressTimer = setInterval(async () => {
-        if (progressSyncInFlight) {
-          return;
-        }
+        suppressedPromoteTimer = setTimeout(async () => {
+          if (streamClosed || streamTrackingStarted) {
+            return;
+          }
 
-        const current = playbackSessions.get(playbackClient.sessionKey);
-        if (!current || current.itemId !== String(trackId) || current.state !== 'playing') {
-          return;
-        }
-
-        progressSyncInFlight = true;
-        try {
-          await syncClientPlaybackState({
+          const stillSuppressed = shouldSuppressPlaybackSyncForStreamLoad({
             accountId: account.id,
-            plexState,
             clientName,
-            itemId: trackId,
-            state: 'playing',
-            positionMs: estimatePlaybackPositionMs(),
-            durationMs: trackDurationMs,
-            request,
+            trackId,
           });
-        } catch (error) {
-          request.log.warn(error, 'Failed to sync stream progress playback status to Plex');
-        } finally {
-          progressSyncInFlight = false;
-        }
-      }, STREAM_PROGRESS_HEARTBEAT_MS);
+          if (!stillSuppressed) {
+            await startStreamPlaybackTracking(estimatePlaybackPositionMs());
+            return;
+          }
 
-      if (typeof progressTimer.unref === 'function') {
-        progressTimer.unref();
+          const hasScrobbleDrivenContinuity = Number(continuityState.at || 0) > 0;
+          if (hasScrobbleDrivenContinuity) {
+            request.log.debug(
+              { trackId, clientName },
+              'Keeping suppressed stream pending explicit scrobble/queue continuity',
+            );
+            return;
+          }
+
+          // Fallback only for clients that never provide continuity signals.
+          await startStreamPlaybackTracking(estimatePlaybackPositionMs());
+        }, STREAM_SUPPRESSED_PROMOTE_DELAY_MS);
+
+        if (typeof suppressedPromoteTimer.unref === 'function') {
+          suppressedPromoteTimer.unref();
+        }
+      } else {
+        await startStreamPlaybackTracking(offsetMs);
       }
 
       const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
       const rangeHeader = request.headers.range;
+      const upstreamController = new AbortController();
+      const abortUpstreamOnDisconnect = () => {
+        if (!upstreamController.signal.aborted) {
+          upstreamController.abort();
+        }
+      };
+      request.raw.once('aborted', abortUpstreamOnDisconnect);
+      request.raw.once('close', abortUpstreamOnDisconnect);
+      reply.raw.once('close', abortUpstreamOnDisconnect);
+
       const upstream = await fetchWithRetry({
         url: streamUrl,
         options: {
           headers: {
             ...(rangeHeader ? { Range: rangeHeader } : {}),
           },
+          signal: upstreamController.signal,
         },
         request,
         context: 'track stream proxy',
@@ -7028,6 +7326,7 @@ export async function buildServer(config = loadConfig()) {
 
       if (!upstream.ok || !upstream.body) {
         clearProgressTimer();
+        clearSuppressedPromoteTimer();
         request.log.warn({ status: upstream.status }, 'Failed to proxy track stream');
         return sendSubsonicError(reply, 70, 'Track stream unavailable');
       }
@@ -7048,8 +7347,34 @@ export async function buildServer(config = loadConfig()) {
         }
       }
 
-      return reply.send(Readable.fromWeb(upstream.body));
+      const proxiedBody = Readable.fromWeb(upstream.body);
+      const responseBody = new PassThrough();
+
+      proxiedBody.on('error', (streamError) => {
+        if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+          request.log.debug({ trackId, clientName }, 'Ignoring expected stream termination');
+          responseBody.end();
+          return;
+        }
+        request.log.warn(streamError, 'Upstream stream error while proxying track');
+        responseBody.destroy(streamError);
+      });
+
+      responseBody.on('error', (streamError) => {
+        if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+          request.log.debug({ trackId, clientName }, 'Ignoring expected response stream termination');
+          return;
+        }
+        request.log.warn(streamError, 'Response stream error while proxying track');
+      });
+
+      proxiedBody.pipe(responseBody);
+      return reply.send(responseBody);
     } catch (error) {
+      if (isAbortError(error) || isUpstreamTerminationError(error) || isClientDisconnected(request, reply)) {
+        request.log.debug({ trackId }, 'Ignoring expected stream disconnect');
+        return;
+      }
       request.log.error(error, 'Failed to proxy stream');
       return sendSubsonicError(reply, 10, 'Stream proxy failed');
     }

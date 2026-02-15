@@ -177,7 +177,7 @@ Plexsonic maps Subsonic rating + star state into a single Plex numeric rating:
 
 Behavior:
 - `setRating(r)` updates stars and keeps current like state when possible.
-- `star` toggles like on and keeps star level. If unrated, it becomes `2` points (liked + 1-star).
+- `star` toggles like on and keeps star level. If unrated, it becomes `10` points (liked + 5+star).
 - `unstar` toggles like off and keeps star level.
 
 ## Expose to LAN

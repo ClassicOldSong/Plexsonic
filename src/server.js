@@ -997,7 +997,7 @@ function subsonicRatingToPlexRating(value, { liked = false } = {}) {
 function toLikedPlexRating(value) {
   const normalized = normalizePlexRatingInt(value);
   if (normalized == null || normalized <= 0) {
-    return 2;
+    return 10;
   }
   const stars = Math.max(1, Math.min(5, Math.ceil(normalized / 2)));
   return stars * 2;

@@ -1,6 +1,6 @@
 {
   "name": "plexsonic",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "PlexMusic to OpenSubsonic bridge",
   "main": "./src/index.js",
   "bin": {
@@ -25,7 +25,7 @@
     "@fastify/session": "^11.1.1",
     "argon2": "^0.44.0",
     "better-sqlite3": "^12.6.2",
-    "dotenv": "^17.2.4",
+    "dotenv": "^17.3.1",
     "fastify": "^5.7.4",
     "pino-pretty": "^13.1.3"
   },

@@ -71,6 +71,8 @@ export function pageTemplate({ title, body, notice = '' }) {
       --primary-hover: #1d4ed8;
       --danger: #dc2626;
       --danger-bg: #fef2f2;
+      --success: #059669;
+      --success-bg: #ecfdf5;
       --border: #e5e7eb;
       --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     }
@@ -126,6 +128,12 @@ export function pageTemplate({ title, body, notice = '' }) {
       margin-bottom: 24px;
       font-size: 0.9rem;
       text-align: center;
+    }
+
+    .notice.success {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: var(--success);
     }
 
     form {
@@ -257,6 +265,12 @@ export function pageTemplate({ title, body, notice = '' }) {
       word-break: break-all;
     }
 
+    .status.success {
+      color: var(--success);
+      background: var(--success-bg);
+      border-color: var(--success);
+    }
+
     .test-output {
       white-space: pre-wrap;
       overflow: auto;
@@ -279,7 +293,11 @@ export function pageTemplate({ title, body, notice = '' }) {
 </head>
 <body>
   <main>
-    ${notice ? `<div class="notice">${escapeHtml(notice)}</div>` : ''}
+    ${(() => {
+      if (!notice) return '';
+      const isSuccess = /successfully|linked|connected|verified|saved|complete|updated|signed out|unlinked/i.test(notice);
+      return `<div class="notice ${isSuccess ? 'success' : ''}">${escapeHtml(notice)}</div>`;
+    })()}
     ${body}
   </main>
 </body>
@@ -379,7 +397,7 @@ export function linkedPlexPage({
 }) {
   const statusLines = [
     `<p><strong>User:</strong> ${escapeHtml(username)}</p>`,
-    `<p><strong>Plex link:</strong> Connected</p>`,
+    `<p><strong>Plex link:</strong> <span style="color: var(--success); font-weight: 600;">Connected</span></p>`,
     `<p><strong>Server:</strong> ${serverName ? escapeHtml(serverName) : 'Not selected yet'}</p>`,
     `<p><strong>Music library:</strong> ${libraryName ? escapeHtml(libraryName) : 'Not selected yet'}</p>`,
   ].join('');
@@ -479,6 +497,7 @@ export function plexPinPage({ authUrl, sid, phase }) {
           if (!closed) {
             hintEl.textContent = 'Plex linked. You can close this page now.';
             statusEl.textContent = 'Plex authorization completed.';
+            statusEl.classList.add('success');
             manualLinkEl.style.display = 'none';
           }
         }
@@ -489,6 +508,7 @@ export function plexPinPage({ authUrl, sid, phase }) {
             const data = await res.json();
             if (data.status === 'linked') {
               statusEl.textContent = 'Plex linked. Attempting to close...';
+              statusEl.classList.add('success');
               closeOrShowMessage(data.next || '/link/plex/server');
               return;
             }
@@ -629,9 +649,21 @@ export function testPage({ username }) {
               },
             });
             const text = await res.text();
-            out.textContent = formatResponse(text);
+            const formatted = formatResponse(text);
+            out.textContent = formatted;
+            try {
+              const data = JSON.parse(text);
+              if (data?.['subsonic-response']?.status === 'ok') {
+                out.classList.add('success');
+              } else {
+                out.classList.remove('success');
+              }
+            } catch {
+              out.classList.remove('success');
+            }
           } catch (err) {
             out.textContent = 'Request failed: ' + err.message;
+            out.classList.remove('success');
           }
         }
 

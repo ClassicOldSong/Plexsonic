@@ -7150,6 +7150,134 @@ export async function buildServer(config = loadConfig()) {
     }
   });
 
+  app.get('/rest/download.view', async (request, reply) => {
+    const account = await authenticateSubsonicRequest(request, reply, repo, tokenCipher);
+    if (!account) {
+      return;
+    }
+
+    const trackId = getQueryString(request, 'id');
+    if (!trackId) {
+      return sendSubsonicError(reply, 70, 'Missing track id');
+    }
+
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
+    if (!plexState) {
+      return;
+    }
+
+    try {
+      const track = await getTrack({
+        baseUrl: plexState.baseUrl,
+        plexToken: plexState.plexToken,
+        trackId,
+      });
+
+      if (!track) {
+        return sendSubsonicError(reply, 70, 'Track not found');
+      }
+
+      const part = partFromTrack(track);
+      const partKey = part?.key;
+
+      if (!partKey) {
+        return sendSubsonicError(reply, 70, 'Track has no downloadable part');
+      }
+
+      const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
+      const rangeHeader = request.headers.range;
+      const upstreamController = new AbortController();
+      const abortUpstreamOnDisconnect = () => {
+        if (!upstreamController.signal.aborted) {
+          upstreamController.abort();
+        }
+      };
+      request.raw.once('aborted', abortUpstreamOnDisconnect);
+      request.raw.once('close', abortUpstreamOnDisconnect);
+      reply.raw.once('close', abortUpstreamOnDisconnect);
+
+      const upstream = await fetchWithRetry({
+        url: streamUrl,
+        options: {
+          headers: {
+            ...(rangeHeader ? { Range: rangeHeader } : {}),
+          },
+          signal: upstreamController.signal,
+        },
+        request,
+        context: 'track download proxy',
+        maxAttempts: 3,
+        baseDelayMs: 250,
+      });
+
+      if (!upstream.ok || !upstream.body) {
+        request.log.warn({ status: upstream.status }, 'Failed to proxy track download');
+        return sendSubsonicError(reply, 70, 'Track download unavailable');
+      }
+
+      reply.code(upstream.status);
+
+      for (const headerName of [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'etag',
+        'last-modified',
+      ]) {
+        const value = upstream.headers.get(headerName);
+        if (value) {
+          reply.header(headerName, value);
+        }
+      }
+
+      const fileName = part?.file ? part.file.split(/[/\\]/).pop() : null;
+      if (fileName) {
+        reply.header(
+          'content-disposition',
+          `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+        );
+      }
+
+      const proxiedBody = Readable.fromWeb(upstream.body);
+      const responseBody = new PassThrough();
+
+      proxiedBody.on('error', (streamError) => {
+        if (
+          isAbortError(streamError) ||
+          isUpstreamTerminationError(streamError) ||
+          isClientDisconnected(request, reply)
+        ) {
+          responseBody.end();
+          return;
+        }
+        request.log.warn(streamError, 'Upstream stream error while proxying track download');
+        responseBody.destroy(streamError);
+      });
+
+      responseBody.on('error', (streamError) => {
+        if (
+          isAbortError(streamError) ||
+          isUpstreamTerminationError(streamError) ||
+          isClientDisconnected(request, reply)
+        ) {
+          return;
+        }
+        request.log.warn(streamError, 'Response stream error while proxying track download');
+      });
+
+      proxiedBody.pipe(responseBody);
+      return reply.send(responseBody);
+    } catch (error) {
+      if (isAbortError(error) || isUpstreamTerminationError(error) || isClientDisconnected(request, reply)) {
+        return;
+      }
+      request.log.error(error, 'Failed to proxy download');
+      return sendSubsonicError(reply, 10, 'Download proxy failed');
+    }
+  });
+
   app.get('/rest/stream.view', async (request, reply) => {
     const account = await authenticateSubsonicRequest(request, reply, repo, tokenCipher);
     if (!account) {

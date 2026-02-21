@@ -716,6 +716,7 @@ function groupArtistsForSubsonic(artists) {
           name: artist.name,
           albumCount: artistAlbumCountValue(artist.artist),
           coverArt: artist.id,
+          roles: ['artist'],
           ...subsonicRatingAttrs(artist.artist),
         }),
       );

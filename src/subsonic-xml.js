@@ -263,15 +263,6 @@ function nodeToJson(node) {
     out[child.name] = value;
   }
 
-  const arrayChildren = ARRAY_CHILDREN_BY_PARENT[node.name];
-  if (arrayChildren) {
-    for (const childName of arrayChildren) {
-      if (!Object.prototype.hasOwnProperty.call(out, childName)) {
-        out[childName] = [];
-      }
-    }
-  }
-
   const keys = Object.keys(out);
   if (keys.length === 1 && keys[0] === 'value') {
     return out.value;

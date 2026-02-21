@@ -27,12 +27,7 @@ const SERVER_TYPE = 'Plexsonic';
 const SERVER_VERSION = APP_VERSION;
 const OPEN_SUBSONIC = true;
 
-const TOKEN_START = '\u0001';
-const TOKEN_END = '\u0002';
-const TOKEN_PATTERN = /\u0001(\d+)\u0002/g;
 
-let nodeSeq = 0;
-const nodeRegistry = new Map();
 
 export function xmlEscape(value) {
   const sanitized = sanitizeXmlText(String(value));
@@ -62,52 +57,17 @@ function sanitizeXmlText(value) {
   return output;
 }
 
-function storeNode(node) {
-  const id = ++nodeSeq;
-  nodeRegistry.set(id, node);
-  return `${TOKEN_START}${id}${TOKEN_END}`;
-}
-
-function parseTokenText(text) {
-  const out = [];
-  let index = 0;
-  let match;
-
-  TOKEN_PATTERN.lastIndex = 0;
-  while ((match = TOKEN_PATTERN.exec(text)) !== null) {
-    const before = text.slice(index, match.index);
-    if (before) {
-      out.push(before);
-    }
-
-    const nodeId = Number(match[1]);
-    const tokenNode = nodeRegistry.get(nodeId);
-    if (tokenNode) {
-      out.push(tokenNode);
-    }
-
-    index = match.index + match[0].length;
-  }
-
-  const tail = text.slice(index);
-  if (tail) {
-    out.push(tail);
-  }
-
-  return out;
-}
-
 function normalizeChildren(input) {
-  if (input == null) {
+  if (input == null || input === '') {
     return [];
   }
   if (Array.isArray(input)) {
     return input.flatMap((item) => normalizeChildren(item));
   }
-  if (typeof input === 'string') {
-    return parseTokenText(input);
-  }
   if (typeof input === 'object' && input.kind === 'node') {
+    return [input];
+  }
+  if (typeof input === 'string') {
     return [input];
   }
   return [String(input)];
@@ -137,9 +97,7 @@ function renderXmlPart(part) {
   return `<${part.name}${attrs}>${inner}</${part.name}>`;
 }
 
-function renderXmlChildren(inner) {
-  return normalizeChildren(inner).map(renderXmlPart).join('');
-}
+
 
 const NUMERIC_ATTRS = new Set([
   'code',
@@ -200,6 +158,7 @@ const ARRAY_CHILDREN_BY_PARENT = {
   index: new Set(['artist']),
   artist: new Set(['album']),
   album: new Set(['song']),
+  albumArtists: new Set(['artist']),
   songsByGenre: new Set(['song']),
   randomSongs: new Set(['song']),
   topSongs: new Set(['song']),
@@ -318,6 +277,19 @@ function nodeToJson(node) {
     return out.value;
   }
 
+  if (node.name === 'artists' || node.name === 'albumArtists') {
+    if (node.attrs?.flatten === 'true') {
+      const artistValue = out.artist;
+      if (Array.isArray(artistValue)) {
+        return artistValue;
+      }
+      if (artistValue != null) {
+        return [artistValue];
+      }
+      return [];
+    }
+  }
+
   if (node.name === 'openSubsonicExtensions') {
     const extensions = out.openSubsonicExtension;
     if (Array.isArray(extensions)) {
@@ -347,23 +319,23 @@ function subsonicRoot(status, children = []) {
 }
 
 export function emptyNode(name, attrs = {}) {
-  return storeNode({
+  return {
     kind: 'node',
     name,
     attrs,
     children: [],
     selfClosing: true,
-  });
+  };
 }
 
-export function node(name, attrs = {}, inner = '') {
-  return storeNode({
+export function node(name, attrs = {}, inner = null) {
+  return {
     kind: 'node',
     name,
     attrs,
     children: normalizeChildren(inner),
     selfClosing: false,
-  });
+  };
 }
 
 export function okResponse(inner = '') {
@@ -410,16 +382,3 @@ export function failedResponseJson(code, message) {
   return { 'subsonic-response': json };
 }
 
-// Backward-compatible export for older callsites.
-export function responseJson(xml) {
-  // Kept only for compatibility during migration; no XML parsing path is used by server responses.
-  return {
-    'subsonic-response': {
-      status: 'failed',
-      error: {
-        code: 10,
-        message: 'responseJson(xml) is deprecated',
-      },
-    },
-  };
-}

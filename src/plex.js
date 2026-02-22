@@ -198,6 +198,83 @@ function extractMetadataList(container) {
   return asArray(container.Metadata ?? container.Directory ?? container.Video ?? container.Track ?? []);
 }
 
+function parseContainerTotalSize(container) {
+  const parsed = Number.parseInt(String(container?.totalSize ?? ''), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+}
+
+async function fetchAllMetadataPages({
+  baseUrl,
+  plexToken,
+  path,
+  searchParams = null,
+  signal = undefined,
+  pageSize = 1000,
+}) {
+  const normalizedPageSize = Math.min(Math.max(Number.parseInt(String(pageSize), 10) || 1000, 1), 2000);
+  const merged = [];
+  const seenRatingKeys = new Set();
+  let start = 0;
+  let totalSize = null;
+  let attempts = 0;
+
+  while (attempts < 2000) {
+    const payload = await fetchPmsJson(
+      baseUrl,
+      plexToken,
+      path,
+      {
+        ...(searchParams || {}),
+        'X-Plex-Container-Start': start,
+        'X-Plex-Container-Size': normalizedPageSize,
+      },
+      { signal },
+    );
+    const container = payload?.MediaContainer || {};
+    const page = extractMetadataList(container);
+    const pageTotalSize = parseContainerTotalSize(container);
+    if (pageTotalSize != null) {
+      totalSize = pageTotalSize;
+    }
+
+    if (page.length === 0) {
+      break;
+    }
+
+    let added = 0;
+    for (const item of page) {
+      const ratingKey = String(item?.ratingKey ?? '').trim();
+      if (ratingKey) {
+        if (seenRatingKeys.has(ratingKey)) {
+          continue;
+        }
+        seenRatingKeys.add(ratingKey);
+      }
+      merged.push(item);
+      added += 1;
+    }
+
+    start += page.length;
+    attempts += 1;
+
+    if (totalSize != null && start >= totalSize) {
+      break;
+    }
+    if (page.length < normalizedPageSize) {
+      break;
+    }
+    if (added === 0) {
+      // Guard against servers that ignore paging and keep returning the same page.
+      break;
+    }
+  }
+
+  return merged;
+}
+
 function normalizeLibrarySection(section) {
   const parseTimestamp = (value) => {
     const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -806,27 +883,36 @@ export async function searchSectionHubs({
 }
 
 export async function listArtists({ baseUrl, plexToken, sectionId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/sections/${encodeURIComponent(sectionId)}/all`, {
-    type: 8,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/sections/${encodeURIComponent(sectionId)}/all`,
+    searchParams: {
+      type: 8,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function listAlbums({ baseUrl, plexToken, sectionId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/sections/${encodeURIComponent(sectionId)}/all`, {
-    type: 9,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/sections/${encodeURIComponent(sectionId)}/all`,
+    searchParams: {
+      type: 9,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function listTracks({ baseUrl, plexToken, sectionId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/sections/${encodeURIComponent(sectionId)}/all`, {
-    type: 10,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/sections/${encodeURIComponent(sectionId)}/all`,
+    searchParams: {
+      type: 10,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function probeSectionFingerprint({ baseUrl, plexToken, sectionId, signal = undefined }) {
@@ -868,19 +954,25 @@ export async function getArtist({ baseUrl, plexToken, artistId }) {
 }
 
 export async function listArtistAlbums({ baseUrl, plexToken, artistId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/metadata/${encodeURIComponent(artistId)}/children`, {
-    type: 9,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/metadata/${encodeURIComponent(artistId)}/children`,
+    searchParams: {
+      type: 9,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function listArtistTracks({ baseUrl, plexToken, artistId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/metadata/${encodeURIComponent(artistId)}/allLeaves`, {
-    type: 10,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/metadata/${encodeURIComponent(artistId)}/allLeaves`,
+    searchParams: {
+      type: 10,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function getAlbum({ baseUrl, plexToken, albumId }) {
@@ -893,11 +985,14 @@ export async function getAlbum({ baseUrl, plexToken, albumId }) {
 }
 
 export async function listAlbumTracks({ baseUrl, plexToken, albumId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/metadata/${encodeURIComponent(albumId)}/children`, {
-    type: 10,
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: `/library/metadata/${encodeURIComponent(albumId)}/children`,
+    searchParams: {
+      type: 10,
+    },
   });
-
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function getTrack({ baseUrl, plexToken, trackId, signal = undefined }) {

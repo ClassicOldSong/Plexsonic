@@ -53,6 +53,7 @@ PORT=3127
 BIND_HOST=127.0.0.1
 BASE_URL=
 SQLITE_PATH=./data/app.db
+CACHE_SQLITE_PATH=./data/cache.db
 SESSION_SECRET=replace-with-a-long-random-secret
 TOKEN_ENC_KEY=
 PLEX_PRODUCT=Plexsonic Bridge
@@ -69,6 +70,8 @@ LOG_REQUESTS=0
 - `PORT`: HTTP port (default `3127`).
 - `BIND_HOST`: listen interface (`127.0.0.1` local only, `0.0.0.0` for LAN).
 - `BASE_URL`: optional public URL override used for callback generation. If empty, origin is derived from request headers.
+- `SQLITE_PATH`: credentials/session/application database path.
+- `CACHE_SQLITE_PATH`: WAL-backed Plex metadata cache database path.
 - `PLEX_WEBHOOK_TOKEN`: optional shared secret for `/webhooks/plex`. If set, webhook calls must provide this token.
 - `SESSION_SECRET`: cookie/session signing secret. Keep stable across restarts.
 - `TOKEN_ENC_KEY`: optional but recommended 32-byte key (hex or base64) used to encrypt stored Plex tokens.

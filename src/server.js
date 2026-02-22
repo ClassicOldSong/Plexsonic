@@ -27,7 +27,7 @@ import fastifyFormbody from '@fastify/formbody';
 import fastifyMultipart from '@fastify/multipart';
 import fastifySession from '@fastify/session';
 import { loadConfig } from './config.js';
-import { createRepositories, migrate, openDatabase } from './db.js';
+import { createRepositories, migrate, migrateCache, openDatabase } from './db.js';
 import {
   decodeChoicePayload,
   encodeChoicePayload,
@@ -1310,7 +1310,7 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     displayArtist: normalizedArtist,
     displayAlbumArtist,
     displayComposer,
-    artistId: track.grandparentRatingKey || undefined,
+    artistId: track.grandparentRatingKey || track.artistId || undefined,
     type: 'music',
     duration: durationSeconds(track.duration),
     track: trackNumber,
@@ -1347,7 +1347,7 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
 
 function trackArtistEntries(track) {
   const artistId = firstNonEmptyText(
-    [track?.artistId, track?.guid, track?.grandparentRatingKey],
+    [track?.grandparentRatingKey, track?.artistId, track?.guid],
     '',
   );
   const artistName = firstNonEmptyText(
@@ -1360,7 +1360,7 @@ function trackArtistEntries(track) {
 
 function trackAlbumArtistEntries(track, albumMetadata = null) {
   const albumArtistId = firstNonEmptyText(
-    [albumMetadata?.artistId, albumMetadata?.parentRatingKey, track?.artistId, track?.grandparentRatingKey],
+    [albumMetadata?.parentRatingKey, track?.grandparentRatingKey, albumMetadata?.artistId, track?.artistId],
     '',
   );
   const albumArtistName = firstNonEmptyText(
@@ -1996,6 +1996,120 @@ function isNumericRatingKey(value) {
   return /^\d+$/.test(String(value || '').trim());
 }
 
+function metadataPathRatingKey(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+  const match = raw.match(/\/library\/metadata\/(\d+)(?:$|[/?#])/i);
+  if (!match) {
+    return '';
+  }
+  return String(match[1] || '').trim();
+}
+
+function comparableIdVariants(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return new Set();
+  }
+  const decoded = (() => {
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  })();
+
+  const variants = new Set();
+  const push = (candidate) => {
+    const text = String(candidate || '').trim();
+    if (!text) {
+      return;
+    }
+    const normalized = safeLower(text.replace(/\/+$/, ''));
+    if (normalized) {
+      variants.add(normalized);
+    }
+  };
+
+  push(raw);
+  push(decoded);
+  push(raw.replace('://', '/'));
+  push(decoded.replace('://', '/'));
+
+  const metadataId = metadataPathRatingKey(raw) || metadataPathRatingKey(decoded);
+  if (metadataId) {
+    push(metadataId);
+  }
+  const trailingNumericId = (decoded.match(/(?:^|[/:])(\d+)(?:$|[/?#])/i) || [])[1];
+  if (trailingNumericId) {
+    push(trailingNumericId);
+  }
+
+  return variants;
+}
+
+function itemHasMatchingId(item, requestedId) {
+  const requested = comparableIdVariants(requestedId);
+  if (requested.size === 0 || !item || typeof item !== 'object') {
+    return false;
+  }
+
+  const candidateValues = [];
+  const pushCandidate = (value) => {
+    if (value == null) {
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        pushCandidate(entry);
+      }
+      return;
+    }
+    if (typeof value === 'object') {
+      pushCandidate(value.id);
+      pushCandidate(value.guid);
+      pushCandidate(value.key);
+      return;
+    }
+    candidateValues.push(String(value));
+  };
+
+  pushCandidate(item.ratingKey);
+  pushCandidate(item.guid);
+  pushCandidate(item.key);
+  pushCandidate(item.sourceUri);
+  pushCandidate(item.sourceURI);
+  pushCandidate(item.Guid);
+
+  for (const value of candidateValues) {
+    const variants = comparableIdVariants(value);
+    for (const variant of variants) {
+      if (requested.has(variant)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function findItemByRequestedId(items, requestedId) {
+  const source = Array.isArray(items) ? items : [];
+  const normalizedRequested = String(requestedId || '').trim();
+  if (!normalizedRequested) {
+    return null;
+  }
+
+  const exact = source.find((item) => String(item?.ratingKey || '').trim() === normalizedRequested);
+  if (exact) {
+    return exact;
+  }
+
+  return source.find((item) => itemHasMatchingId(item, normalizedRequested)) || null;
+}
+
 function isUpstreamTerminationError(error) {
   if (!error) {
     return false;
@@ -2093,6 +2207,97 @@ function safeLower(value) {
 
 function includesText(haystack, needle) {
   return safeLower(haystack).includes(safeLower(needle));
+}
+
+function trackPrimaryArtistName(track) {
+  return firstNonEmptyText(
+    [track?.artist, track?.originalTitle, track?.grandparentTitle],
+    '',
+  );
+}
+
+function trackPrimaryArtistId(track) {
+  return firstNonEmptyText(
+    [track?.grandparentRatingKey, track?.artistId, track?.guid],
+    '',
+  );
+}
+
+function matchesArtistSearchQuery(artist, query) {
+  return includesText(artist?.title, query) || includesText(artist?.name, query);
+}
+
+function matchesAlbumSearchQuery(album, query) {
+  return includesText(album?.title, query) ||
+    includesText(album?.parentTitle, query) ||
+    includesText(album?.originalTitle, query);
+}
+
+function matchesTrackSearchQuery(track, query) {
+  return includesText(track?.title, query) ||
+    includesText(track?.grandparentTitle, query) ||
+    includesText(track?.parentTitle, query) ||
+    includesText(trackPrimaryArtistName(track), query);
+}
+
+function pickPagedSearchSource(filteredItems, fallbackItems, offset, count) {
+  const filtered = Array.isArray(filteredItems) ? filteredItems : [];
+  const fallback = Array.isArray(fallbackItems) ? fallbackItems : [];
+  if (count <= 0) {
+    return filtered.length > 0 ? filtered : fallback;
+  }
+  if (filtered.length > offset) {
+    return filtered;
+  }
+  return fallback;
+}
+
+function deriveVirtualArtistsFromTracks(tracks, query = '') {
+  const source = Array.isArray(tracks) ? tracks : [];
+  const grouped = new Map();
+
+  for (const track of source) {
+    const artistId = String(trackPrimaryArtistId(track) || '').trim();
+    const artistName = String(trackPrimaryArtistName(track) || '').trim();
+    if (!artistId || !artistName) {
+      continue;
+    }
+    if (query && !includesText(artistName, query)) {
+      continue;
+    }
+
+    const key = `${safeLower(artistId)}::${safeLower(artistName)}`;
+    const current = grouped.get(key) || {
+      ratingKey: artistId,
+      title: artistName,
+      albumIds: new Set(),
+      addedAt: 0,
+      updatedAt: 0,
+      thumb: '',
+    };
+    const albumId = String(track?.parentRatingKey || '').trim();
+    if (albumId) {
+      current.albumIds.add(albumId);
+    }
+    current.addedAt = Math.max(Number(current.addedAt || 0), Number(track?.addedAt || 0));
+    current.updatedAt = Math.max(Number(current.updatedAt || 0), Number(track?.updatedAt || 0));
+    if (!current.thumb) {
+      current.thumb = String(track?.grandparentRatingKey || track?.parentRatingKey || '').trim();
+    }
+    grouped.set(key, current);
+  }
+
+  return [...grouped.values()]
+    .map((entry) => ({
+      ratingKey: entry.ratingKey,
+      title: entry.title,
+      albumCount: entry.albumIds.size,
+      leafCount: entry.albumIds.size,
+      addedAt: entry.addedAt || undefined,
+      updatedAt: entry.updatedAt || undefined,
+      thumb: entry.thumb || undefined,
+    }))
+    .sort((a, b) => String(a?.title || '').localeCompare(String(b?.title || '')));
 }
 
 function normalizeSearchQuery(value) {
@@ -2479,6 +2684,73 @@ function metadataFieldValues(sources, keys) {
   return [];
 }
 
+function buildPlexStateFromContext(plexContext, tokenCipher) {
+  const plexTokenCandidates = [];
+  if (plexContext.server_token_enc) {
+    try {
+      const serverToken = decodePlexTokenOrThrow(tokenCipher, plexContext.server_token_enc);
+      plexTokenCandidates.push(serverToken);
+    } catch { }
+  }
+  if (plexContext.plex_token_enc) {
+    try {
+      const accountToken = decodePlexTokenOrThrow(tokenCipher, plexContext.plex_token_enc);
+      plexTokenCandidates.push(accountToken);
+    } catch { }
+  }
+
+  const plexToken = uniqueNonEmptyValues(plexTokenCandidates);
+  if (plexToken.length === 0) {
+    return null;
+  }
+
+  return {
+    accountId: plexContext.account_id,
+    username: plexContext.username,
+    plexToken,
+    baseUrl: plexContext.server_base_url,
+    machineId: plexContext.machine_id,
+    musicSectionId: plexContext.music_section_id,
+    musicSectionName: plexContext.music_section_name || null,
+    serverName: plexContext.server_name || 'Plex Music',
+  };
+}
+
+function hasPlexSelectionContext(plexContext) {
+  return Boolean(
+    plexContext &&
+    (plexContext.plex_token_enc || plexContext.server_token_enc) &&
+    plexContext.server_base_url &&
+    plexContext.machine_id &&
+    plexContext.music_section_id,
+  );
+}
+
+function chooseRecoverableMusicSection(sections, preferredId, preferredName) {
+  const source = Array.isArray(sections) ? sections : [];
+  if (source.length === 0) {
+    return null;
+  }
+  const preferredIdText = String(preferredId || '').trim();
+  if (preferredIdText) {
+    const exact = source.find((section) => String(section?.id || '').trim() === preferredIdText);
+    if (exact) {
+      return exact;
+    }
+  }
+  const preferredNameText = safeLower(String(preferredName || '').trim());
+  if (preferredNameText) {
+    const byName = source.find((section) => safeLower(String(section?.title || '').trim()) === preferredNameText);
+    if (byName) {
+      return byName;
+    }
+  }
+  if (source.length === 1) {
+    return source[0];
+  }
+  return null;
+}
+
 function requiredPlexStateForSubsonic(reply, plexContext, tokenCipher) {
   if (!plexContext?.plex_token_enc && !plexContext?.server_token_enc) {
     sendSubsonicError(reply, 10, 'Plex not linked');
@@ -2500,36 +2772,12 @@ function requiredPlexStateForSubsonic(reply, plexContext, tokenCipher) {
     return null;
   }
 
-  const plexTokenCandidates = [];
-  if (plexContext.server_token_enc) {
-    try {
-      const serverToken = decodePlexTokenOrThrow(tokenCipher, plexContext.server_token_enc);
-      plexTokenCandidates.push(serverToken);
-    } catch { }
-  }
-  if (plexContext.plex_token_enc) {
-    try {
-      const accountToken = decodePlexTokenOrThrow(tokenCipher, plexContext.plex_token_enc);
-      plexTokenCandidates.push(accountToken);
-    } catch { }
-  }
-
-  const plexToken = uniqueNonEmptyValues(plexTokenCandidates);
-  if (plexToken.length === 0) {
+  const plexState = buildPlexStateFromContext(plexContext, tokenCipher);
+  if (!plexState) {
     sendSubsonicError(reply, 10, 'Stored Plex token is unreadable');
     return null;
   }
-
-  return {
-    accountId: plexContext.account_id,
-    username: plexContext.username,
-    plexToken,
-    baseUrl: plexContext.server_base_url,
-    machineId: plexContext.machine_id,
-    musicSectionId: plexContext.music_section_id,
-    musicSectionName: plexContext.music_section_name || null,
-    serverName: plexContext.server_name || 'Plex Music',
-  };
+  return plexState;
 }
 
 function createSqliteSessionStore(db, logger) {
@@ -2616,6 +2864,8 @@ function createSqliteSessionStore(db, logger) {
 export async function buildServer(config = loadConfig()) {
   const db = openDatabase(config.sqlitePath);
   migrate(db);
+  const cacheDb = openDatabase(config.cacheSqlitePath || config.sqlitePath);
+  migrateCache(cacheDb);
 
   const repo = createRepositories(db);
   const tokenCipher = createTokenCipher({
@@ -2659,6 +2909,7 @@ export async function buildServer(config = loadConfig()) {
   app.decorate('config', config);
   app.decorate('repo', repo);
   app.decorate('db', db);
+  app.decorate('cacheDb', cacheDb);
 
   if (!tokenCipher.hasExplicitKey) {
     app.log.warn('TOKEN_ENC_KEY missing or invalid. Falling back to hash of SESSION_SECRET for token encryption.');
@@ -2691,6 +2942,7 @@ export async function buildServer(config = loadConfig()) {
   });
 
   app.addHook('onClose', async () => {
+    cacheDb.close();
     db.close();
   });
 
@@ -2707,112 +2959,1524 @@ export async function buildServer(config = loadConfig()) {
   const PLAYBACK_CONTINUITY_AFTER_SCROBBLE_MS = 15000;
   const PLAY_QUEUE_IDLE_TTL_MS = 6 * 60 * 60 * 1000;
   const activeSearchRequests = new Map();
-  const searchBrowseCache = new Map();
+  const cacheWarmupInFlight = new Map();
+  const cacheCollectionLoadInFlight = new Map();
+  const cacheRefreshInFlight = new Map();
+  const cacheChangeCheckInFlight = new Map();
   const SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS = 15000;
   const SEARCH_BROWSE_CHANGE_CHECK_DEBOUNCE_MS = 15000;
-  const SEARCH_BROWSE_CACHE_IDLE_TTL_MS = 10 * 60 * 1000;
-  const SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS = 2 * 60 * 1000;
-  const SEARCH_BROWSE_CACHE_MAX_ENTRIES = 16;
   const SEARCH_BROWSE_COLLECTIONS = ['artists', 'albums', 'tracks'];
-
-  function pruneSearchBrowseCache(now = Date.now()) {
-    for (const [cacheKey, entry] of searchBrowseCache.entries()) {
-      if (!entry || (now - Number(entry.lastAccessAt || 0)) > SEARCH_BROWSE_CACHE_IDLE_TTL_MS) {
-        searchBrowseCache.delete(cacheKey);
-      }
+  const getLibraryCacheStateStmt = cacheDb.prepare(`
+    SELECT cache_key, last_fingerprint, last_checked_at, last_synced_at, dirty, updated_at
+    FROM plex_library_cache_state
+    WHERE cache_key = ?
+  `);
+  const upsertLibraryCacheStateStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_state (
+      cache_key,
+      last_fingerprint,
+      last_checked_at,
+      last_synced_at,
+      dirty,
+      updated_at
+    )
+    VALUES (
+      @cache_key,
+      @last_fingerprint,
+      @last_checked_at,
+      @last_synced_at,
+      @dirty,
+      @updated_at
+    )
+    ON CONFLICT(cache_key)
+    DO UPDATE SET
+      last_fingerprint = excluded.last_fingerprint,
+      last_checked_at = excluded.last_checked_at,
+      last_synced_at = excluded.last_synced_at,
+      dirty = excluded.dirty,
+      updated_at = excluded.updated_at
+  `);
+  const hasLibraryCacheDataStmt = cacheDb.prepare(`
+    SELECT 1 AS exists_flag
+    FROM (
+      SELECT cache_key FROM plex_library_cache_artists WHERE cache_key = ?
+      UNION ALL
+      SELECT cache_key FROM plex_library_cache_albums WHERE cache_key = ?
+      UNION ALL
+      SELECT cache_key FROM plex_library_cache_tracks WHERE cache_key = ?
+    )
+    LIMIT 1
+  `);
+  const hasLibraryCacheArtistsStmt = cacheDb.prepare(`
+    SELECT 1 AS exists_flag
+    FROM plex_library_cache_artists
+    WHERE cache_key = ?
+    LIMIT 1
+  `);
+  const hasLibraryCacheAlbumsStmt = cacheDb.prepare(`
+    SELECT 1 AS exists_flag
+    FROM plex_library_cache_albums
+    WHERE cache_key = ?
+    LIMIT 1
+  `);
+  const hasLibraryCacheTracksStmt = cacheDb.prepare(`
+    SELECT 1 AS exists_flag
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ?
+    LIMIT 1
+  `);
+  const selectLibraryCacheArtistRowsStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_artists
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectLibraryCacheAlbumRowsStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectLibraryCacheTrackRowsStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectAlbumGenreRowsStmt = cacheDb.prepare(`
+    SELECT album_rating_key, genre_name
+    FROM plex_library_cache_album_genres
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackGenreRowsStmt = cacheDb.prepare(`
+    SELECT track_rating_key, genre_name
+    FROM plex_library_cache_track_genres
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackArtistRowsStmt = cacheDb.prepare(`
+    SELECT track_rating_key, artist_id, artist_name
+    FROM plex_library_cache_track_artists
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackAlbumArtistRowsStmt = cacheDb.prepare(`
+    SELECT track_rating_key, artist_id, artist_name
+    FROM plex_library_cache_track_album_artists
+    WHERE cache_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackGenresByTrackStmt = cacheDb.prepare(`
+    SELECT genre_name
+    FROM plex_library_cache_track_genres
+    WHERE cache_key = ? AND track_rating_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackArtistsByTrackStmt = cacheDb.prepare(`
+    SELECT artist_id, artist_name
+    FROM plex_library_cache_track_artists
+    WHERE cache_key = ? AND track_rating_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectTrackAlbumArtistsByTrackStmt = cacheDb.prepare(`
+    SELECT artist_id, artist_name
+    FROM plex_library_cache_track_album_artists
+    WHERE cache_key = ? AND track_rating_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectAlbumGenresByAlbumStmt = cacheDb.prepare(`
+    SELECT genre_name
+    FROM plex_library_cache_album_genres
+    WHERE cache_key = ? AND album_rating_key = ?
+    ORDER BY order_index ASC
+  `);
+  const selectArtistRowByRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_artists
+    WHERE cache_key = ? AND rating_key = ?
+    LIMIT 1
+  `);
+  const selectArtistRowByTitleStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_artists
+    WHERE cache_key = ? AND lower(COALESCE(title, '')) = lower(?)
+    LIMIT 1
+  `);
+  const selectArtistRowByIdentityStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_artists
+    WHERE cache_key = @cache_key
+      AND (
+        rating_key = @exact
+        OR lower(COALESCE(guid, '')) = @lowered
+        OR lower(COALESCE(key_path, '')) = @lowered
+        OR lower(COALESCE(source_uri, '')) = @lowered
+      )
+    LIMIT 1
+  `);
+  const selectAlbumRowByRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = ? AND rating_key = ?
+    LIMIT 1
+  `);
+  const selectAlbumRowByIdentityStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND (
+        rating_key = @exact
+        OR lower(COALESCE(guid, '')) = @lowered
+        OR lower(COALESCE(key_path, '')) = @lowered
+        OR lower(COALESCE(source_uri, '')) = @lowered
+      )
+    LIMIT 1
+  `);
+  const selectTrackRowByRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ? AND rating_key = ?
+    LIMIT 1
+  `);
+  const selectTrackRowByIdentityStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = @cache_key
+      AND (
+        rating_key = @exact
+        OR lower(COALESCE(guid, '')) = @lowered
+        OR lower(COALESCE(key_path, '')) = @lowered
+        OR lower(COALESCE(source_uri, '')) = @lowered
+        OR lower(COALESCE(part_file, '')) = @lowered
+      )
+    LIMIT 1
+  `);
+  const selectAlbumsByParentRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = ? AND parent_rating_key = ?
+    ORDER BY sort_key ASC, rating_key ASC
+  `);
+  const selectAlbumsByParentTitleStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = ? AND lower(parent_title) = lower(?)
+    ORDER BY sort_key ASC, rating_key ASC
+  `);
+  const selectTracksByGrandparentRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ? AND grandparent_rating_key = ?
+    ORDER BY sort_key ASC, parent_index ASC, track_index ASC, rating_key ASC
+  `);
+  const selectTracksByGrandparentTitleStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ? AND lower(grandparent_title) = lower(?)
+    ORDER BY sort_key ASC, parent_index ASC, track_index ASC, rating_key ASC
+  `);
+  const selectTracksByParentRatingKeyStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_tracks
+    WHERE cache_key = ? AND parent_rating_key = ?
+    ORDER BY sort_key ASC, parent_index ASC, track_index ASC, rating_key ASC
+  `);
+  const selectTracksByGenreStmt = cacheDb.prepare(`
+    SELECT t.*
+    FROM plex_library_cache_tracks t
+    INNER JOIN plex_library_cache_track_genres g
+      ON g.cache_key = t.cache_key
+     AND g.track_rating_key = t.rating_key
+    WHERE t.cache_key = @cache_key
+      AND lower(g.genre_name) = lower(@genre)
+    ORDER BY
+      lower(COALESCE(t.grandparent_title, '')) ASC,
+      lower(COALESCE(t.parent_title, '')) ASC,
+      COALESCE(t.parent_index, 1) ASC,
+      COALESCE(t.track_index, 0) ASC,
+      lower(COALESCE(t.title, '')) ASC,
+      t.rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const selectArtistsPageByQueryStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_artists
+    WHERE cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(title, '')) LIKE @pattern OR
+        lower(COALESCE(title_sort, '')) LIKE @pattern
+      )
+    ORDER BY sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const selectAlbumsPageByQueryStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(title, '')) LIKE @pattern OR
+        lower(COALESCE(parent_title, '')) LIKE @pattern OR
+        lower(COALESCE(original_title, '')) LIKE @pattern
+      )
+    ORDER BY sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const selectTracksPageByQueryStmt = cacheDb.prepare(`
+    SELECT t.*
+    FROM plex_library_cache_tracks t
+    WHERE t.cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(t.title, '')) LIKE @pattern OR
+        lower(COALESCE(t.parent_title, '')) LIKE @pattern OR
+        lower(COALESCE(t.grandparent_title, '')) LIKE @pattern OR
+        EXISTS (
+          SELECT 1
+          FROM plex_library_cache_track_artists ta
+          WHERE ta.cache_key = t.cache_key
+            AND ta.track_rating_key = t.rating_key
+            AND lower(COALESCE(ta.artist_name, '')) LIKE @pattern
+        )
+      )
+    ORDER BY
+      lower(COALESCE(t.grandparent_title, '')) ASC,
+      lower(COALESCE(t.parent_title, '')) ASC,
+      COALESCE(t.parent_index, 1) ASC,
+      COALESCE(t.track_index, 0) ASC,
+      lower(COALESCE(t.title, '')) ASC,
+      t.rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countArtistsByQueryStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_artists
+    WHERE cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(title, '')) LIKE @pattern OR
+        lower(COALESCE(title_sort, '')) LIKE @pattern
+      )
+  `);
+  const countAlbumsByQueryStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(title, '')) LIKE @pattern OR
+        lower(COALESCE(parent_title, '')) LIKE @pattern OR
+        lower(COALESCE(original_title, '')) LIKE @pattern
+      )
+  `);
+  const countTracksByQueryStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_tracks t
+    WHERE t.cache_key = @cache_key
+      AND (
+        @query = '' OR
+        lower(COALESCE(t.title, '')) LIKE @pattern OR
+        lower(COALESCE(t.parent_title, '')) LIKE @pattern OR
+        lower(COALESCE(t.grandparent_title, '')) LIKE @pattern OR
+        EXISTS (
+          SELECT 1
+          FROM plex_library_cache_track_artists ta
+          WHERE ta.cache_key = t.cache_key
+            AND ta.track_rating_key = t.rating_key
+            AND lower(COALESCE(ta.artist_name, '')) LIKE @pattern
+        )
+      )
+  `);
+  const countTracksByGenreStmt = cacheDb.prepare(`
+    SELECT COUNT(DISTINCT t.rating_key) AS total
+    FROM plex_library_cache_tracks t
+    INNER JOIN plex_library_cache_track_genres g
+      ON g.cache_key = t.cache_key
+     AND g.track_rating_key = t.rating_key
+    WHERE t.cache_key = @cache_key
+      AND lower(g.genre_name) = lower(@genre)
+  `);
+  const selectGenreSummaryRowsStmt = cacheDb.prepare(`
+    SELECT
+      MIN(g.genre_name) AS genre_name,
+      COUNT(DISTINCT t.rating_key) AS song_count,
+      COUNT(DISTINCT t.parent_rating_key) AS album_count
+    FROM plex_library_cache_track_genres g
+    INNER JOIN plex_library_cache_tracks t
+      ON t.cache_key = g.cache_key
+     AND t.rating_key = g.track_rating_key
+    WHERE g.cache_key = ?
+    GROUP BY lower(g.genre_name)
+    ORDER BY lower(MIN(g.genre_name)) ASC
+  `);
+  const selectAlbumsAlphabeticalByNameStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+    ORDER BY sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsAlphabeticalByNameStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+  `);
+  const selectAlbumsAlphabeticalByArtistStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+    ORDER BY lower(COALESCE(parent_title, '')) ASC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsAlphabeticalByArtistStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+  `);
+  const selectAlbumsNewestStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+    ORDER BY COALESCE(added_at, 0) DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsNewestStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+  `);
+  const selectAlbumsHighestStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(user_rating, 0) > 0
+    ORDER BY COALESCE(user_rating, 0) DESC, COALESCE(updated_at, added_at, 0) DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsHighestStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(user_rating, 0) > 0
+  `);
+  const selectAlbumsFrequentStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(play_count, 0) > 0
+    ORDER BY COALESCE(play_count, 0) DESC, COALESCE(last_viewed_at, updated_at, added_at, 0) DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsFrequentStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(play_count, 0) > 0
+  `);
+  const selectAlbumsRecentStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(last_viewed_at, 0) > 0
+    ORDER BY COALESCE(last_viewed_at, 0) DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsRecentStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND COALESCE(last_viewed_at, 0) > 0
+  `);
+  const selectAlbumsStarredStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND user_rating IS NOT NULL
+      AND CAST(user_rating AS INTEGER) >= 2
+      AND (CAST(user_rating AS INTEGER) % 2) = 0
+    ORDER BY COALESCE(updated_at, added_at, 0) DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsStarredStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND user_rating IS NOT NULL
+      AND CAST(user_rating AS INTEGER) >= 2
+      AND (CAST(user_rating AS INTEGER) % 2) = 0
+  `);
+  const selectAlbumsByYearAscStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND year >= @year_low
+      AND year <= @year_high
+    ORDER BY year ASC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const selectAlbumsByYearDescStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND year >= @year_low
+      AND year <= @year_high
+    ORDER BY year DESC, sort_key ASC, rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsByYearStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+      AND year >= @year_low
+      AND year <= @year_high
+  `);
+  const selectAlbumsByGenreStmt = cacheDb.prepare(`
+    SELECT a.*
+    FROM plex_library_cache_albums a
+    WHERE a.cache_key = @cache_key
+      AND EXISTS (
+        SELECT 1
+        FROM plex_library_cache_album_genres g
+        WHERE g.cache_key = a.cache_key
+          AND g.album_rating_key = a.rating_key
+          AND lower(g.genre_name) = lower(@genre)
+      )
+    ORDER BY a.sort_key ASC, a.rating_key ASC
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsByGenreStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums a
+    WHERE a.cache_key = @cache_key
+      AND EXISTS (
+        SELECT 1
+        FROM plex_library_cache_album_genres g
+        WHERE g.cache_key = a.cache_key
+          AND g.album_rating_key = a.rating_key
+          AND lower(g.genre_name) = lower(@genre)
+      )
+  `);
+  const selectAlbumsRandomStmt = cacheDb.prepare(`
+    SELECT *
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+    ORDER BY random()
+    LIMIT @limit OFFSET @offset
+  `);
+  const countAlbumsRandomStmt = cacheDb.prepare(`
+    SELECT COUNT(1) AS total
+    FROM plex_library_cache_albums
+    WHERE cache_key = @cache_key
+  `);
+  const deleteLibraryCacheArtistsStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_artists
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheAlbumsStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_albums
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheAlbumGenresStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_album_genres
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheTracksStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_tracks
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheTrackGenresStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_track_genres
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheTrackArtistsStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_track_artists
+    WHERE cache_key = ?
+  `);
+  const deleteLibraryCacheTrackAlbumArtistsStmt = cacheDb.prepare(`
+    DELETE FROM plex_library_cache_track_album_artists
+    WHERE cache_key = ?
+  `);
+  const insertLibraryCacheArtistStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_artists (
+      cache_key,
+      rating_key,
+      order_index,
+      sort_key,
+      title,
+      title_sort,
+      summary,
+      thumb,
+      key_path,
+      guid,
+      source_uri,
+      added_at,
+      updated_at,
+      user_rating,
+      child_count,
+      leaf_count,
+      album_count,
+      type,
+      updated_cache_at
+    )
+    VALUES (
+      @cache_key,
+      @rating_key,
+      @order_index,
+      @sort_key,
+      @title,
+      @title_sort,
+      @summary,
+      @thumb,
+      @key_path,
+      @guid,
+      @source_uri,
+      @added_at,
+      @updated_at,
+      @user_rating,
+      @child_count,
+      @leaf_count,
+      @album_count,
+      @type,
+      @updated_cache_at
+    )
+  `);
+  const insertLibraryCacheAlbumStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_albums (
+      cache_key,
+      rating_key,
+      order_index,
+      sort_key,
+      title,
+      title_sort,
+      original_title,
+      parent_rating_key,
+      parent_title,
+      thumb,
+      key_path,
+      guid,
+      source_uri,
+      added_at,
+      updated_at,
+      last_viewed_at,
+      user_rating,
+      play_count,
+      child_count,
+      leaf_count,
+      duration,
+      year,
+      type,
+      updated_cache_at
+    )
+    VALUES (
+      @cache_key,
+      @rating_key,
+      @order_index,
+      @sort_key,
+      @title,
+      @title_sort,
+      @original_title,
+      @parent_rating_key,
+      @parent_title,
+      @thumb,
+      @key_path,
+      @guid,
+      @source_uri,
+      @added_at,
+      @updated_at,
+      @last_viewed_at,
+      @user_rating,
+      @play_count,
+      @child_count,
+      @leaf_count,
+      @duration,
+      @year,
+      @type,
+      @updated_cache_at
+    )
+  `);
+  const insertLibraryCacheAlbumGenreStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_album_genres (
+      cache_key,
+      album_rating_key,
+      order_index,
+      genre_name
+    )
+    VALUES (
+      @cache_key,
+      @album_rating_key,
+      @order_index,
+      @genre_name
+    )
+  `);
+  const insertLibraryCacheTrackStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_tracks (
+      cache_key,
+      rating_key,
+      order_index,
+      sort_key,
+      title,
+      title_sort,
+      original_title,
+      parent_rating_key,
+      parent_title,
+      grandparent_rating_key,
+      grandparent_title,
+      artist_id,
+      key_path,
+      guid,
+      source_uri,
+      thumb,
+      added_at,
+      updated_at,
+      last_viewed_at,
+      user_rating,
+      view_count,
+      duration,
+      track_index,
+      parent_index,
+      disc_number,
+      parent_year,
+      year,
+      media_bitrate,
+      media_container,
+      part_size,
+      part_file,
+      audio_sampling_rate,
+      audio_bit_depth,
+      audio_stream_language,
+      composer,
+      country,
+      style,
+      mood,
+      record_label,
+      language,
+      album_type,
+      is_compilation,
+      is_soundtrack,
+      type,
+      updated_cache_at
+    )
+    VALUES (
+      @cache_key,
+      @rating_key,
+      @order_index,
+      @sort_key,
+      @title,
+      @title_sort,
+      @original_title,
+      @parent_rating_key,
+      @parent_title,
+      @grandparent_rating_key,
+      @grandparent_title,
+      @artist_id,
+      @key_path,
+      @guid,
+      @source_uri,
+      @thumb,
+      @added_at,
+      @updated_at,
+      @last_viewed_at,
+      @user_rating,
+      @view_count,
+      @duration,
+      @track_index,
+      @parent_index,
+      @disc_number,
+      @parent_year,
+      @year,
+      @media_bitrate,
+      @media_container,
+      @part_size,
+      @part_file,
+      @audio_sampling_rate,
+      @audio_bit_depth,
+      @audio_stream_language,
+      @composer,
+      @country,
+      @style,
+      @mood,
+      @record_label,
+      @language,
+      @album_type,
+      @is_compilation,
+      @is_soundtrack,
+      @type,
+      @updated_cache_at
+    )
+  `);
+  const insertLibraryCacheTrackGenreStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_track_genres (
+      cache_key,
+      track_rating_key,
+      order_index,
+      genre_name
+    )
+    VALUES (
+      @cache_key,
+      @track_rating_key,
+      @order_index,
+      @genre_name
+    )
+  `);
+  const insertLibraryCacheTrackArtistStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_track_artists (
+      cache_key,
+      track_rating_key,
+      order_index,
+      artist_id,
+      artist_name
+    )
+    VALUES (
+      @cache_key,
+      @track_rating_key,
+      @order_index,
+      @artist_id,
+      @artist_name
+    )
+  `);
+  const insertLibraryCacheTrackAlbumArtistStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_track_album_artists (
+      cache_key,
+      track_rating_key,
+      order_index,
+      artist_id,
+      artist_name
+    )
+    VALUES (
+      @cache_key,
+      @track_rating_key,
+      @order_index,
+      @artist_id,
+      @artist_name
+    )
+  `);
+  const selectDistinctCacheKeysByRatingKeyStmt = cacheDb.prepare(`
+    SELECT DISTINCT cache_key
+    FROM (
+      SELECT cache_key FROM plex_library_cache_tracks WHERE rating_key = ?
+      UNION ALL
+      SELECT cache_key FROM plex_library_cache_albums WHERE rating_key = ?
+      UNION ALL
+      SELECT cache_key FROM plex_library_cache_artists WHERE rating_key = ?
+    )
+  `);
+  const selectCachedItemRatingStmt = cacheDb.prepare(`
+    SELECT user_rating, updated_at
+    FROM (
+      SELECT user_rating, updated_at, 0 AS priority
+      FROM plex_library_cache_tracks
+      WHERE cache_key = @cache_key AND rating_key = @rating_key
+      UNION ALL
+      SELECT user_rating, updated_at, 1 AS priority
+      FROM plex_library_cache_albums
+      WHERE cache_key = @cache_key AND rating_key = @rating_key
+      UNION ALL
+      SELECT user_rating, updated_at, 2 AS priority
+      FROM plex_library_cache_artists
+      WHERE cache_key = @cache_key AND rating_key = @rating_key
+    )
+    ORDER BY priority ASC
+    LIMIT 1
+  `);
+  const updateArtistRatingStmt = cacheDb.prepare(`
+    UPDATE plex_library_cache_artists
+    SET user_rating = @user_rating,
+        updated_at = @updated_at,
+        updated_cache_at = @updated_cache_at
+    WHERE cache_key = @cache_key
+      AND rating_key = @rating_key
+  `);
+  const updateAlbumRatingStmt = cacheDb.prepare(`
+    UPDATE plex_library_cache_albums
+    SET user_rating = @user_rating,
+        updated_at = @updated_at,
+        updated_cache_at = @updated_cache_at
+    WHERE cache_key = @cache_key
+      AND rating_key = @rating_key
+  `);
+  const updateTrackRatingStmt = cacheDb.prepare(`
+    UPDATE plex_library_cache_tracks
+    SET user_rating = @user_rating,
+        updated_at = @updated_at,
+        updated_cache_at = @updated_cache_at
+    WHERE cache_key = @cache_key
+      AND rating_key = @rating_key
+  `);
+  const markLibraryCacheDirtyByKeyStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_state (
+      cache_key,
+      last_fingerprint,
+      last_checked_at,
+      last_synced_at,
+      dirty,
+      updated_at
+    )
+    VALUES (
+      @cache_key,
+      '',
+      0,
+      0,
+      1,
+      @updated_at
+    )
+    ON CONFLICT(cache_key)
+    DO UPDATE SET
+      last_synced_at = 0,
+      dirty = 1,
+      updated_at = excluded.updated_at
+  `);
+  const markAllLibraryCachesDirtyStmt = cacheDb.prepare(`
+    UPDATE plex_library_cache_state
+    SET last_synced_at = 0,
+        dirty = 1,
+        updated_at = @updated_at
+  `);
+  const ensureStateRowsForCacheItemsStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_state (
+      cache_key,
+      last_fingerprint,
+      last_checked_at,
+      last_synced_at,
+      dirty,
+      updated_at
+    )
+    SELECT DISTINCT cache_key, '', 0, 0, 1, @updated_at
+    FROM (
+      SELECT cache_key FROM plex_library_cache_artists
+      UNION
+      SELECT cache_key FROM plex_library_cache_albums
+      UNION
+      SELECT cache_key FROM plex_library_cache_tracks
+    )
+    WHERE 1
+    ON CONFLICT(cache_key)
+    DO UPDATE SET
+      last_synced_at = 0,
+      dirty = 1,
+      updated_at = excluded.updated_at
+  `);
+  const replaceArtistCacheTx = cacheDb.transaction((cacheKey, rows, nowSeconds) => {
+    deleteLibraryCacheArtistsStmt.run(cacheKey);
+    for (const row of rows) {
+      insertLibraryCacheArtistStmt.run(row);
     }
-
-    if (searchBrowseCache.size <= SEARCH_BROWSE_CACHE_MAX_ENTRIES) {
-      return;
+    const currentState = getLibraryCacheStateStmt.get(cacheKey);
+    upsertLibraryCacheStateStmt.run({
+      cache_key: cacheKey,
+      last_fingerprint: String(currentState?.last_fingerprint || ''),
+      last_checked_at: Number(currentState?.last_checked_at || 0),
+      last_synced_at: nowSeconds,
+      dirty: Number(currentState?.dirty || 0) ? 1 : 0,
+      updated_at: nowSeconds,
+    });
+  });
+  const replaceAlbumCacheTx = cacheDb.transaction((cacheKey, albumRows, genreRows, nowSeconds) => {
+    deleteLibraryCacheAlbumGenresStmt.run(cacheKey);
+    deleteLibraryCacheAlbumsStmt.run(cacheKey);
+    for (const row of albumRows) {
+      insertLibraryCacheAlbumStmt.run(row);
     }
-
-    const sortedByExpiry = [...searchBrowseCache.entries()]
-      .sort((a, b) => (a[1]?.lastAccessAt || 0) - (b[1]?.lastAccessAt || 0));
-    for (const [cacheKey] of sortedByExpiry) {
-      if (searchBrowseCache.size <= SEARCH_BROWSE_CACHE_MAX_ENTRIES) {
-        break;
-      }
-      searchBrowseCache.delete(cacheKey);
+    for (const row of genreRows) {
+      insertLibraryCacheAlbumGenreStmt.run(row);
     }
-  }
+    const currentState = getLibraryCacheStateStmt.get(cacheKey);
+    upsertLibraryCacheStateStmt.run({
+      cache_key: cacheKey,
+      last_fingerprint: String(currentState?.last_fingerprint || ''),
+      last_checked_at: Number(currentState?.last_checked_at || 0),
+      last_synced_at: nowSeconds,
+      dirty: Number(currentState?.dirty || 0) ? 1 : 0,
+      updated_at: nowSeconds,
+    });
+  });
+  const replaceTrackCacheTx = cacheDb.transaction((cacheKey, trackRows, genreRows, artistRows, albumArtistRows, nowSeconds) => {
+    deleteLibraryCacheTrackAlbumArtistsStmt.run(cacheKey);
+    deleteLibraryCacheTrackArtistsStmt.run(cacheKey);
+    deleteLibraryCacheTrackGenresStmt.run(cacheKey);
+    deleteLibraryCacheTracksStmt.run(cacheKey);
+    for (const row of trackRows) {
+      insertLibraryCacheTrackStmt.run(row);
+    }
+    for (const row of genreRows) {
+      insertLibraryCacheTrackGenreStmt.run(row);
+    }
+    for (const row of artistRows) {
+      insertLibraryCacheTrackArtistStmt.run(row);
+    }
+    for (const row of albumArtistRows) {
+      insertLibraryCacheTrackAlbumArtistStmt.run(row);
+    }
+    const currentState = getLibraryCacheStateStmt.get(cacheKey);
+    upsertLibraryCacheStateStmt.run({
+      cache_key: cacheKey,
+      last_fingerprint: String(currentState?.last_fingerprint || ''),
+      last_checked_at: Number(currentState?.last_checked_at || 0),
+      last_synced_at: nowSeconds,
+      dirty: Number(currentState?.dirty || 0) ? 1 : 0,
+      updated_at: nowSeconds,
+    });
+  });
 
   function searchBrowseCacheKey(accountId, plexState) {
     return `${accountId}:${plexState.machineId}:${plexState.musicSectionId}`;
   }
 
-  function createSearchBrowseCollectionState() {
+  function emptyLibraryCacheState() {
     return {
-      data: null,
-      loading: null,
-      loadedAt: 0,
-      lastRefreshAt: 0,
+      lastFingerprint: '',
+      lastCheckedAt: 0,
+      lastSyncedAt: 0,
+      dirty: false,
     };
   }
 
-  function getSearchBrowseCacheEntry(cacheKey, now = Date.now()) {
-    const existing = searchBrowseCache.get(cacheKey);
-    if (existing) {
-      existing.lastAccessAt = now;
-      return existing;
+  function getPersistedLibraryCacheState(cacheKey) {
+    const row = getLibraryCacheStateStmt.get(cacheKey);
+    if (!row) {
+      return {
+        cacheKey,
+        ...emptyLibraryCacheState(),
+      };
     }
-
-    const created = {
-      lastAccessAt: now,
-      collections: {
-        artists: createSearchBrowseCollectionState(),
-        albums: createSearchBrowseCollectionState(),
-        tracks: createSearchBrowseCollectionState(),
-      },
-      libraryState: {
-        lastCheckedAt: 0,
-        checking: null,
-        lastFingerprint: '',
-        dirty: false,
-        refreshPromise: null,
-        ratingOverrides: new Map(),
-      },
+    return {
+      cacheKey,
+      lastFingerprint: String(row.last_fingerprint || ''),
+      lastCheckedAt: Number(row.last_checked_at || 0),
+      lastSyncedAt: Number(row.last_synced_at || 0),
+      dirty: Number(row.dirty || 0) === 1,
     };
-    searchBrowseCache.set(cacheKey, created);
-    pruneSearchBrowseCache(now);
-    return created;
   }
 
-  function getSearchBrowseCollectionState(entry, collection) {
-    if (!entry?.collections || !SEARCH_BROWSE_COLLECTIONS.includes(collection)) {
+  function persistLibraryCacheState(cacheKey, state, nowSeconds = Math.floor(Date.now() / 1000)) {
+    const source = state || emptyLibraryCacheState();
+    upsertLibraryCacheStateStmt.run({
+      cache_key: cacheKey,
+      last_fingerprint: String(source.lastFingerprint || ''),
+      last_checked_at: Number(source.lastCheckedAt || 0),
+      last_synced_at: Number(source.lastSyncedAt || 0),
+      dirty: source.dirty ? 1 : 0,
+      updated_at: nowSeconds,
+    });
+  }
+
+  function buildArtistCacheRows(cacheKey, artists, nowSeconds) {
+    const rows = [];
+    for (let i = 0; i < artists.length; i += 1) {
+      const artist = artists[i];
+      const ratingKey = String(artist?.ratingKey || '').trim();
+      if (!ratingKey) {
+        continue;
+      }
+      rows.push({
+        cache_key: cacheKey,
+        rating_key: ratingKey,
+        order_index: i,
+        sort_key: safeLower(artist?.title || artist?.name || ratingKey),
+        title: firstNonEmptyText([artist?.title, artist?.name], null),
+        title_sort: firstNonEmptyText([artist?.titleSort], null),
+        summary: firstNonEmptyText([artist?.summary], null),
+        thumb: firstNonEmptyText([artist?.thumb], null),
+        key_path: firstNonEmptyText([artist?.key], null),
+        guid: firstNonEmptyText([artist?.guid], null),
+        source_uri: firstNonEmptyText([artist?.sourceUri, artist?.sourceURI], null),
+        added_at: parseNonNegativeInt(artist?.addedAt, null),
+        updated_at: parseNonNegativeInt(artist?.updatedAt, null),
+        user_rating: normalizePlexRating(artist?.userRating),
+        child_count: parseNonNegativeInt(artist?.childCount, null),
+        leaf_count: parseNonNegativeInt(artist?.leafCount, null),
+        album_count: parseNonNegativeInt(artist?.albumCount, null),
+        type: firstNonEmptyText([artist?.type], 'artist'),
+        updated_cache_at: nowSeconds,
+      });
+    }
+    return rows;
+  }
+
+  function buildAlbumCachePayload(cacheKey, albums, nowSeconds) {
+    const albumRows = [];
+    const genreRows = [];
+    for (let i = 0; i < albums.length; i += 1) {
+      const album = albums[i];
+      const ratingKey = String(album?.ratingKey || '').trim();
+      if (!ratingKey) {
+        continue;
+      }
+      albumRows.push({
+        cache_key: cacheKey,
+        rating_key: ratingKey,
+        order_index: i,
+        sort_key: safeLower(album?.title || album?.name || ratingKey),
+        title: firstNonEmptyText([album?.title, album?.name], null),
+        title_sort: firstNonEmptyText([album?.titleSort], null),
+        original_title: firstNonEmptyText([album?.originalTitle], null),
+        parent_rating_key: firstNonEmptyText([album?.parentRatingKey], null),
+        parent_title: firstNonEmptyText([album?.parentTitle], null),
+        thumb: firstNonEmptyText([album?.thumb], null),
+        key_path: firstNonEmptyText([album?.key], null),
+        guid: firstNonEmptyText([album?.guid], null),
+        source_uri: firstNonEmptyText([album?.sourceUri, album?.sourceURI], null),
+        added_at: parseNonNegativeInt(album?.addedAt, null),
+        updated_at: parseNonNegativeInt(album?.updatedAt, null),
+        last_viewed_at: parseNonNegativeInt(album?.lastViewedAt, null),
+        user_rating: normalizePlexRating(album?.userRating),
+        play_count: parseNonNegativeInt(album?.viewCount ?? album?.playCount, null),
+        child_count: parseNonNegativeInt(album?.childCount, null),
+        leaf_count: parseNonNegativeInt(album?.leafCount, null),
+        duration: parseNonNegativeInt(album?.duration, null),
+        year: parsePositiveInt(album?.year, null),
+        type: firstNonEmptyText([album?.type], 'album'),
+        updated_cache_at: nowSeconds,
+      });
+      const genres = allGenreTags(album);
+      for (let g = 0; g < genres.length; g += 1) {
+        genreRows.push({
+          cache_key: cacheKey,
+          album_rating_key: ratingKey,
+          order_index: g,
+          genre_name: genres[g],
+        });
+      }
+    }
+    return { albumRows, genreRows };
+  }
+
+  function buildTrackCachePayload(cacheKey, tracks, nowSeconds) {
+    const trackRows = [];
+    const genreRows = [];
+    const artistRows = [];
+    const albumArtistRows = [];
+    for (let i = 0; i < tracks.length; i += 1) {
+      const track = tracks[i];
+      const ratingKey = String(track?.ratingKey || '').trim();
+      if (!ratingKey) {
+        continue;
+      }
+      const media = mediaFromTrack(track);
+      const part = partFromTrack(track);
+      const audioStream = audioStreamFromTrack(track);
+      const composer = metadataFieldText(
+        [track],
+        ['Composer', 'composer', 'Composers', 'composers', 'Writer', 'writer'],
+      );
+      const country = metadataFieldText([track], ['Country', 'country']);
+      const style = metadataFieldText([track], ['Style', 'style']);
+      const mood = metadataFieldText([track], ['Mood', 'mood']);
+      const recordLabel = metadataFieldText(
+        [track],
+        ['RecordLabel', 'recordLabel', 'recordlabel', 'Label', 'label', 'Studio', 'studio'],
+      );
+      const language = metadataFieldText([track], ['Language', 'language', 'Lang', 'lang']);
+      const albumType = metadataFieldText(
+        [track],
+        ['albumType', 'AlbumType', 'subtype', 'subType', 'parentSubtype', 'format'],
+      );
+      const compilationValues = metadataFieldValues(
+        [track],
+        ['Compilation', 'compilation', 'isCompilation', 'iscompilation'],
+      );
+      const soundtrackValues = metadataFieldValues(
+        [track],
+        ['Soundtrack', 'soundtrack', 'isSoundtrack', 'issoundtrack'],
+      );
+      trackRows.push({
+        cache_key: cacheKey,
+        rating_key: ratingKey,
+        order_index: i,
+        sort_key: safeLower(track?.title || track?.name || ratingKey),
+        title: firstNonEmptyText([track?.title, track?.name], null),
+        title_sort: firstNonEmptyText([track?.titleSort], null),
+        original_title: firstNonEmptyText([track?.originalTitle], null),
+        parent_rating_key: firstNonEmptyText([track?.parentRatingKey], null),
+        parent_title: firstNonEmptyText([track?.parentTitle], null),
+        grandparent_rating_key: firstNonEmptyText([track?.grandparentRatingKey], null),
+        grandparent_title: firstNonEmptyText([track?.grandparentTitle], null),
+        artist_id: firstNonEmptyText([track?.artistId], null),
+        key_path: firstNonEmptyText([track?.key], null),
+        guid: firstNonEmptyText([track?.guid], null),
+        source_uri: firstNonEmptyText([track?.sourceUri, track?.sourceURI], null),
+        thumb: firstNonEmptyText([track?.thumb], null),
+        added_at: parseNonNegativeInt(track?.addedAt, null),
+        updated_at: parseNonNegativeInt(track?.updatedAt, null),
+        last_viewed_at: parseNonNegativeInt(track?.lastViewedAt, null),
+        user_rating: normalizePlexRating(track?.userRating),
+        view_count: parseNonNegativeInt(track?.viewCount, null),
+        duration: parseNonNegativeInt(track?.duration, null),
+        track_index: parsePositiveInt(track?.index, null),
+        parent_index: parsePositiveInt(track?.parentIndex, null),
+        disc_number: parsePositiveInt(track?.discNumber, null),
+        parent_year: parsePositiveInt(track?.parentYear, null),
+        year: parsePositiveInt(track?.year, null),
+        media_bitrate: parseNonNegativeInt(media?.bitrate, null),
+        media_container: firstNonEmptyText([media?.container], null),
+        part_size: parseNonNegativeInt(part?.size, null),
+        part_file: firstNonEmptyText([part?.file], null),
+        audio_sampling_rate: parsePositiveInt(
+          audioStream?.samplingRate ?? audioStream?.sampleRate ?? audioStream?.audioSamplingRate,
+          null,
+        ),
+        audio_bit_depth: parsePositiveInt(audioStream?.bitDepth ?? audioStream?.bitsPerSample, null),
+        audio_stream_language: firstNonEmptyText(
+          [audioStream?.languageTag, audioStream?.languageCode, audioStream?.language],
+          null,
+        ),
+        composer,
+        country,
+        style,
+        mood,
+        record_label: recordLabel,
+        language,
+        album_type: albumType,
+        is_compilation: compilationValues.length > 0 ? (parseBooleanLike(compilationValues[0], false) ? 1 : 0) : null,
+        is_soundtrack: soundtrackValues.length > 0 ? (parseBooleanLike(soundtrackValues[0], false) ? 1 : 0) : null,
+        type: firstNonEmptyText([track?.type], 'track'),
+        updated_cache_at: nowSeconds,
+      });
+      const genres = allGenreTags(track);
+      for (let g = 0; g < genres.length; g += 1) {
+        genreRows.push({
+          cache_key: cacheKey,
+          track_rating_key: ratingKey,
+          order_index: g,
+          genre_name: genres[g],
+        });
+      }
+      const trackArtists = trackArtistEntries(track);
+      for (let a = 0; a < trackArtists.length; a += 1) {
+        artistRows.push({
+          cache_key: cacheKey,
+          track_rating_key: ratingKey,
+          order_index: a,
+          artist_id: firstNonEmptyText([trackArtists[a]?.id], null),
+          artist_name: firstNonEmptyText([trackArtists[a]?.name], ''),
+        });
+      }
+      const trackAlbumArtists = trackAlbumArtistEntries(track);
+      for (let a = 0; a < trackAlbumArtists.length; a += 1) {
+        albumArtistRows.push({
+          cache_key: cacheKey,
+          track_rating_key: ratingKey,
+          order_index: a,
+          artist_id: firstNonEmptyText([trackAlbumArtists[a]?.id], null),
+          artist_name: firstNonEmptyText([trackAlbumArtists[a]?.name], ''),
+        });
+      }
+    }
+    return { trackRows, genreRows, artistRows, albumArtistRows };
+  }
+
+  function hasSearchBrowseCollectionPersistedData(cacheKey) {
+    return Boolean(hasLibraryCacheDataStmt.get(cacheKey, cacheKey, cacheKey));
+  }
+
+  function hasPersistedCollectionData(cacheKey, collection) {
+    if (collection === 'artists') {
+      return Boolean(hasLibraryCacheArtistsStmt.get(cacheKey));
+    }
+    if (collection === 'albums') {
+      return Boolean(hasLibraryCacheAlbumsStmt.get(cacheKey));
+    }
+    if (collection === 'tracks') {
+      return Boolean(hasLibraryCacheTracksStmt.get(cacheKey));
+    }
+    return false;
+  }
+
+  function artistFromCacheRow(row) {
+    return {
+      type: firstNonEmptyText([row?.type], 'artist'),
+      ratingKey: String(row?.rating_key || ''),
+      title: firstNonEmptyText([row?.title], ''),
+      titleSort: firstNonEmptyText([row?.title_sort], undefined),
+      summary: firstNonEmptyText([row?.summary], undefined),
+      thumb: firstNonEmptyText([row?.thumb], undefined),
+      key: firstNonEmptyText([row?.key_path], undefined),
+      guid: firstNonEmptyText([row?.guid], undefined),
+      sourceUri: firstNonEmptyText([row?.source_uri], undefined),
+      sourceURI: firstNonEmptyText([row?.source_uri], undefined),
+      addedAt: parseNonNegativeInt(row?.added_at, undefined),
+      updatedAt: parseNonNegativeInt(row?.updated_at, undefined),
+      userRating: normalizePlexRating(row?.user_rating),
+      childCount: parseNonNegativeInt(row?.child_count, undefined),
+      leafCount: parseNonNegativeInt(row?.leaf_count, undefined),
+      albumCount: parseNonNegativeInt(row?.album_count, undefined),
+    };
+  }
+
+  function albumFromCacheRow(row, genreNames = []) {
+    const genres = (Array.isArray(genreNames) ? genreNames : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    return {
+      type: firstNonEmptyText([row?.type], 'album'),
+      ratingKey: String(row?.rating_key || ''),
+      title: firstNonEmptyText([row?.title], ''),
+      titleSort: firstNonEmptyText([row?.title_sort], undefined),
+      originalTitle: firstNonEmptyText([row?.original_title], undefined),
+      parentRatingKey: firstNonEmptyText([row?.parent_rating_key], undefined),
+      parentTitle: firstNonEmptyText([row?.parent_title], undefined),
+      thumb: firstNonEmptyText([row?.thumb], undefined),
+      key: firstNonEmptyText([row?.key_path], undefined),
+      guid: firstNonEmptyText([row?.guid], undefined),
+      sourceUri: firstNonEmptyText([row?.source_uri], undefined),
+      sourceURI: firstNonEmptyText([row?.source_uri], undefined),
+      addedAt: parseNonNegativeInt(row?.added_at, undefined),
+      updatedAt: parseNonNegativeInt(row?.updated_at, undefined),
+      lastViewedAt: parseNonNegativeInt(row?.last_viewed_at, undefined),
+      userRating: normalizePlexRating(row?.user_rating),
+      viewCount: parseNonNegativeInt(row?.play_count, undefined),
+      playCount: parseNonNegativeInt(row?.play_count, undefined),
+      childCount: parseNonNegativeInt(row?.child_count, undefined),
+      leafCount: parseNonNegativeInt(row?.leaf_count, undefined),
+      duration: parseNonNegativeInt(row?.duration, undefined),
+      year: parsePositiveInt(row?.year, undefined),
+      Genre: genres.map((tag) => ({ tag })),
+      genre: genres.length > 0 ? genres.join('; ') : undefined,
+    };
+  }
+
+  function trackFromCacheRow(row, { genreNames = [], artists = [], albumArtists = [] } = {}) {
+    const genres = (Array.isArray(genreNames) ? genreNames : [])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    const mediaContainer = firstNonEmptyText([row?.media_container], undefined);
+    const partFile = firstNonEmptyText([row?.part_file], undefined);
+    const partSize = parseNonNegativeInt(row?.part_size, undefined);
+    const streamLanguage = firstNonEmptyText([row?.audio_stream_language], undefined);
+    const media = (mediaContainer || partFile || partSize || row?.media_bitrate)
+      ? [{
+        bitrate: parseNonNegativeInt(row?.media_bitrate, undefined),
+        container: mediaContainer,
+        Part: [{
+          size: partSize,
+          file: partFile,
+          Stream: [{
+            streamType: 2,
+            samplingRate: parsePositiveInt(row?.audio_sampling_rate, undefined),
+            bitDepth: parsePositiveInt(row?.audio_bit_depth, undefined),
+            language: streamLanguage,
+          }],
+        }],
+      }]
+      : undefined;
+    return {
+      type: firstNonEmptyText([row?.type], 'track'),
+      ratingKey: String(row?.rating_key || ''),
+      title: firstNonEmptyText([row?.title], ''),
+      titleSort: firstNonEmptyText([row?.title_sort], undefined),
+      originalTitle: firstNonEmptyText([row?.original_title], undefined),
+      parentRatingKey: firstNonEmptyText([row?.parent_rating_key], undefined),
+      parentTitle: firstNonEmptyText([row?.parent_title], undefined),
+      grandparentRatingKey: firstNonEmptyText([row?.grandparent_rating_key], undefined),
+      grandparentTitle: firstNonEmptyText([row?.grandparent_title], undefined),
+      artistId: firstNonEmptyText([row?.artist_id], undefined),
+      key: firstNonEmptyText([row?.key_path], undefined),
+      guid: firstNonEmptyText([row?.guid], undefined),
+      sourceUri: firstNonEmptyText([row?.source_uri], undefined),
+      sourceURI: firstNonEmptyText([row?.source_uri], undefined),
+      thumb: firstNonEmptyText([row?.thumb], undefined),
+      addedAt: parseNonNegativeInt(row?.added_at, undefined),
+      updatedAt: parseNonNegativeInt(row?.updated_at, undefined),
+      lastViewedAt: parseNonNegativeInt(row?.last_viewed_at, undefined),
+      userRating: normalizePlexRating(row?.user_rating),
+      viewCount: parseNonNegativeInt(row?.view_count, undefined),
+      duration: parseNonNegativeInt(row?.duration, undefined),
+      index: parsePositiveInt(row?.track_index, undefined),
+      parentIndex: parsePositiveInt(row?.parent_index, undefined),
+      discNumber: parsePositiveInt(row?.disc_number, undefined),
+      parentYear: parsePositiveInt(row?.parent_year, undefined),
+      year: parsePositiveInt(row?.year, undefined),
+      Media: media,
+      Genre: genres.map((tag) => ({ tag })),
+      genre: genres.length > 0 ? genres.join('; ') : undefined,
+      artists: Array.isArray(artists) && artists.length > 0 ? artists : undefined,
+      albumArtists: Array.isArray(albumArtists) && albumArtists.length > 0 ? albumArtists : undefined,
+      Composer: firstNonEmptyText([row?.composer], undefined),
+      composer: firstNonEmptyText([row?.composer], undefined),
+      Country: firstNonEmptyText([row?.country], undefined),
+      country: firstNonEmptyText([row?.country], undefined),
+      Style: firstNonEmptyText([row?.style], undefined),
+      style: firstNonEmptyText([row?.style], undefined),
+      Mood: firstNonEmptyText([row?.mood], undefined),
+      mood: firstNonEmptyText([row?.mood], undefined),
+      RecordLabel: firstNonEmptyText([row?.record_label], undefined),
+      recordLabel: firstNonEmptyText([row?.record_label], undefined),
+      Language: firstNonEmptyText([row?.language], undefined),
+      language: firstNonEmptyText([row?.language], undefined),
+      albumType: firstNonEmptyText([row?.album_type], undefined),
+      Compilation: row?.is_compilation == null ? undefined : Number(row.is_compilation) === 1,
+      compilation: row?.is_compilation == null ? undefined : Number(row.is_compilation) === 1,
+      Soundtrack: row?.is_soundtrack == null ? undefined : Number(row.is_soundtrack) === 1,
+      soundtrack: row?.is_soundtrack == null ? undefined : Number(row.is_soundtrack) === 1,
+    };
+  }
+
+  function trackRelationsByRatingKey(cacheKey, ratingKey) {
+    const genres = selectTrackGenresByTrackStmt
+      .all(cacheKey, ratingKey)
+      .map((entry) => String(entry?.genre_name || '').trim())
+      .filter(Boolean);
+    const artists = selectTrackArtistsByTrackStmt
+      .all(cacheKey, ratingKey)
+      .map((entry) => ({
+        id: firstNonEmptyText([entry?.artist_id], undefined),
+        name: firstNonEmptyText([entry?.artist_name], ''),
+      }))
+      .filter((entry) => Boolean(entry.name));
+    const albumArtists = selectTrackAlbumArtistsByTrackStmt
+      .all(cacheKey, ratingKey)
+      .map((entry) => ({
+        id: firstNonEmptyText([entry?.artist_id], undefined),
+        name: firstNonEmptyText([entry?.artist_name], ''),
+      }))
+      .filter((entry) => Boolean(entry.name));
+    return { genres, artists, albumArtists };
+  }
+
+  function albumGenresByRatingKey(cacheKey, ratingKey) {
+    return selectAlbumGenresByAlbumStmt
+      .all(cacheKey, ratingKey)
+      .map((entry) => String(entry?.genre_name || '').trim())
+      .filter(Boolean);
+  }
+
+  function readSearchBrowseCollectionFromSqlite(cacheKey, collection) {
+    if (collection === 'artists') {
+      const rows = selectLibraryCacheArtistRowsStmt.all(cacheKey);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return null;
+      }
+      return rows.map((row) => artistFromCacheRow(row));
+    }
+    if (collection === 'albums') {
+      const rows = selectLibraryCacheAlbumRowsStmt.all(cacheKey);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return null;
+      }
+      const genresByAlbum = new Map();
+      for (const row of selectAlbumGenreRowsStmt.all(cacheKey)) {
+        const albumKey = String(row?.album_rating_key || '').trim();
+        const genre = String(row?.genre_name || '').trim();
+        if (!albumKey || !genre) {
+          continue;
+        }
+        const bucket = genresByAlbum.get(albumKey) || [];
+        bucket.push(genre);
+        genresByAlbum.set(albumKey, bucket);
+      }
+      return rows.map((row) => {
+        const ratingKey = String(row?.rating_key || '');
+        return albumFromCacheRow(row, genresByAlbum.get(ratingKey) || []);
+      });
+    }
+    if (collection === 'tracks') {
+      const rows = selectLibraryCacheTrackRowsStmt.all(cacheKey);
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return null;
+      }
+      const genresByTrack = new Map();
+      for (const row of selectTrackGenreRowsStmt.all(cacheKey)) {
+        const trackKey = String(row?.track_rating_key || '').trim();
+        const genre = String(row?.genre_name || '').trim();
+        if (!trackKey || !genre) {
+          continue;
+        }
+        const bucket = genresByTrack.get(trackKey) || [];
+        bucket.push(genre);
+        genresByTrack.set(trackKey, bucket);
+      }
+      const artistsByTrack = new Map();
+      for (const row of selectTrackArtistRowsStmt.all(cacheKey)) {
+        const trackKey = String(row?.track_rating_key || '').trim();
+        if (!trackKey) {
+          continue;
+        }
+        const bucket = artistsByTrack.get(trackKey) || [];
+        bucket.push({
+          id: firstNonEmptyText([row?.artist_id], undefined),
+          name: firstNonEmptyText([row?.artist_name], ''),
+        });
+        artistsByTrack.set(trackKey, bucket);
+      }
+      const albumArtistsByTrack = new Map();
+      for (const row of selectTrackAlbumArtistRowsStmt.all(cacheKey)) {
+        const trackKey = String(row?.track_rating_key || '').trim();
+        if (!trackKey) {
+          continue;
+        }
+        const bucket = albumArtistsByTrack.get(trackKey) || [];
+        bucket.push({
+          id: firstNonEmptyText([row?.artist_id], undefined),
+          name: firstNonEmptyText([row?.artist_name], ''),
+        });
+        albumArtistsByTrack.set(trackKey, bucket);
+      }
+      return rows.map((row) => {
+        const ratingKey = String(row?.rating_key || '');
+        return trackFromCacheRow(row, {
+          genreNames: genresByTrack.get(ratingKey) || [],
+          artists: artistsByTrack.get(ratingKey) || [],
+          albumArtists: albumArtistsByTrack.get(ratingKey) || [],
+        });
+      });
+    }
+    return null;
+  }
+
+  async function loadSearchBrowseCollection({ cacheKey, collection, loader, request = null, background = false }) {
+    if (!SEARCH_BROWSE_COLLECTIONS.includes(collection)) {
       throw new Error(`Invalid cache collection: ${collection}`);
     }
-    return entry.collections[collection];
-  }
 
-  async function loadSearchBrowseCollection({ entry, collection, loader, request = null, background = false }) {
-    const state = getSearchBrowseCollectionState(entry, collection);
-    if (state.loading) {
-      return state.loading;
+    const inFlightKey = `${cacheKey}:${collection}`;
+    const existing = cacheCollectionLoadInFlight.get(inFlightKey);
+    if (existing) {
+      return existing;
     }
-
-    state.lastRefreshAt = Date.now();
 
     const pending = (async () => {
       const loaded = await loader();
       return Array.isArray(loaded) ? loaded : [];
     })();
-    state.loading = pending;
+    cacheCollectionLoadInFlight.set(inFlightKey, pending);
 
     try {
       const loaded = await pending;
-      applyRatingOverridesToItems(entry, loaded, Date.now());
-      state.data = loaded;
-      state.loadedAt = Date.now();
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (collection === 'artists') {
+        const rows = buildArtistCacheRows(cacheKey, loaded, nowSeconds);
+        replaceArtistCacheTx(cacheKey, rows, nowSeconds);
+      } else if (collection === 'albums') {
+        const payload = buildAlbumCachePayload(cacheKey, loaded, nowSeconds);
+        replaceAlbumCacheTx(cacheKey, payload.albumRows, payload.genreRows, nowSeconds);
+      } else if (collection === 'tracks') {
+        const payload = buildTrackCachePayload(cacheKey, loaded, nowSeconds);
+        replaceTrackCacheTx(
+          cacheKey,
+          payload.trackRows,
+          payload.genreRows,
+          payload.artistRows,
+          payload.albumArtistRows,
+          nowSeconds,
+        );
+      } else {
+        throw new Error(`Invalid cache collection: ${collection}`);
+      }
       return loaded;
     } catch (error) {
       if (background) {
         request?.log?.debug(error, `Background refresh failed for ${collection} cache`);
-        return Array.isArray(state.data) ? state.data : [];
+        const fallback = readSearchBrowseCollectionFromSqlite(cacheKey, collection);
+        if (Array.isArray(fallback)) {
+          return fallback;
+        }
+        return [];
       }
       throw error;
     } finally {
-      if (state.loading === pending) {
-        state.loading = null;
+      if (cacheCollectionLoadInFlight.get(inFlightKey) === pending) {
+        cacheCollectionLoadInFlight.delete(inFlightKey);
       }
     }
   }
@@ -2867,155 +4531,35 @@ export async function buildServer(config = loadConfig()) {
   }
 
   function markSearchBrowseCacheDirty(cacheKey = null) {
-    const targets = cacheKey
-      ? [[cacheKey, searchBrowseCache.get(cacheKey)]]
-      : [...searchBrowseCache.entries()];
-
-    for (const [, entry] of targets) {
-      if (!entry?.libraryState) {
-        continue;
-      }
-      entry.libraryState.dirty = true;
-    }
-  }
-
-  function normalizeRatingOverride({ userRating = null, clearUserRating = false }, nowMs) {
-    if (clearUserRating) {
-      return {
-        userRating: 0,
-        updatedAtSeconds: Math.floor(nowMs / 1000),
-        expiresAt: nowMs + SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS,
-      };
-    }
-
-    const normalized = normalizePlexRating(userRating);
-    if (normalized == null) {
-      return null;
-    }
-
-    return {
-      userRating: normalized,
-      updatedAtSeconds: Math.floor(nowMs / 1000),
-      expiresAt: nowMs + SEARCH_BROWSE_RATING_OVERRIDE_TTL_MS,
-    };
-  }
-
-  function pruneExpiredRatingOverrides(entry, nowMs) {
-    const overrides = entry?.libraryState?.ratingOverrides;
-    if (!(overrides instanceof Map)) {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (cacheKey) {
+      markLibraryCacheDirtyByKeyStmt.run({
+        cache_key: cacheKey,
+        updated_at: nowSeconds,
+      });
       return;
     }
 
-    for (const [itemId, override] of overrides.entries()) {
-      if (!override || Number(override.expiresAt || 0) <= nowMs) {
-        overrides.delete(itemId);
-      }
-    }
+    ensureStateRowsForCacheItemsStmt.run({ updated_at: nowSeconds });
+    markAllLibraryCachesDirtyStmt.run({ updated_at: nowSeconds });
   }
 
-  function recordRatingOverrides(entry, itemIds, ratingPatch, nowMs) {
-    const overrides = entry?.libraryState?.ratingOverrides;
-    if (!(overrides instanceof Map)) {
-      return false;
-    }
-
-    const normalized = normalizeRatingOverride(ratingPatch, nowMs);
-    if (!normalized) {
-      return false;
-    }
-
-    let wrote = false;
-    for (const id of itemIds) {
-      const key = String(id || '').trim();
-      if (!key) {
-        continue;
-      }
-      overrides.set(key, normalized);
-      wrote = true;
-    }
-    return wrote;
-  }
-
-  function applyRatingOverridesToItems(entry, items, nowMs = Date.now()) {
-    const overrides = entry?.libraryState?.ratingOverrides;
-    if (!(overrides instanceof Map) || !Array.isArray(items) || items.length === 0) {
-      return 0;
-    }
-
-    pruneExpiredRatingOverrides(entry, nowMs);
-
-    let patched = 0;
-    for (const item of items) {
-      const ratingKey = String(item?.ratingKey || '').trim();
-      if (!ratingKey) {
-        continue;
-      }
-
-      const override = overrides.get(ratingKey);
-      if (!override) {
-        continue;
-      }
-
-      item.userRating = override.userRating;
-      if (Number.isFinite(override.updatedAtSeconds) && override.updatedAtSeconds > 0) {
-        item.updatedAt = override.updatedAtSeconds;
-      }
-      if (!isPlexLiked(item.userRating)) {
-        delete item.starred;
-        delete item.starredAt;
-      }
-      patched += 1;
-    }
-
-    return patched;
-  }
-
-  function applyUserRatingPatchToCacheEntry(entry, itemIds, { userRating = null, clearUserRating = false }, updatedAtSeconds) {
-    if (!entry?.collections) {
-      return 0;
-    }
-
-    const ids = new Set(
-      (Array.isArray(itemIds) ? itemIds : [])
-        .map((id) => String(id || '').trim())
-        .filter(Boolean),
-    );
-    if (ids.size === 0) {
-      return 0;
-    }
-
-    const nowMs = Date.now();
-    recordRatingOverrides(entry, [...ids], { userRating, clearUserRating }, nowMs);
-    pruneExpiredRatingOverrides(entry, nowMs);
-
+  function applyUserRatingPatchToCacheKey(cacheKey, itemIds, { userRating = null, clearUserRating = false }, updatedAtSeconds) {
+    const nextRating = clearUserRating ? 0 : userRating;
+    const updatedCacheAt = Math.floor(Date.now() / 1000);
     let patchedCount = 0;
-    for (const collection of SEARCH_BROWSE_COLLECTIONS) {
-      const state = entry.collections?.[collection];
-      if (!Array.isArray(state?.data)) {
-        continue;
-      }
-
-      for (const item of state.data) {
-        const ratingKey = String(item?.ratingKey || '').trim();
-        if (!ratingKey || !ids.has(ratingKey)) {
-          continue;
-        }
-        if (clearUserRating) {
-          item.userRating = 0;
-        } else {
-          item.userRating = userRating;
-        }
-        if (!isPlexLiked(item.userRating)) {
-          delete item.starred;
-          delete item.starredAt;
-        }
-        if (Number.isFinite(updatedAtSeconds) && updatedAtSeconds > 0) {
-          item.updatedAt = updatedAtSeconds;
-        }
-        patchedCount += 1;
-      }
+    for (const id of itemIds) {
+      const params = {
+        cache_key: cacheKey,
+        rating_key: String(id || ''),
+        user_rating: nextRating,
+        updated_at: updatedAtSeconds,
+        updated_cache_at: updatedCacheAt,
+      };
+      patchedCount += updateTrackRatingStmt.run(params).changes;
+      patchedCount += updateAlbumRatingStmt.run(params).changes;
+      patchedCount += updateArtistRatingStmt.run(params).changes;
     }
-
     return patchedCount;
   }
 
@@ -3025,20 +4569,36 @@ export async function buildServer(config = loadConfig()) {
     }
     const normalizedRating = clearUserRating ? null : normalizePlexRating(userRating);
 
+    const ids = uniqueNonEmptyValues(itemIds);
+    if (ids.length === 0) {
+      return 0;
+    }
+
     const updatedAtSeconds = Math.floor(Date.now() / 1000);
-    let targets;
+    const targets = new Set();
     if (cacheKey) {
-      const ensuredEntry = getSearchBrowseCacheEntry(cacheKey, Date.now());
-      targets = [[cacheKey, ensuredEntry]];
+      targets.add(cacheKey);
     } else {
-      targets = [...searchBrowseCache.entries()];
+      for (const id of ids) {
+        const rows = selectDistinctCacheKeysByRatingKeyStmt.all(id, id, id);
+        for (const row of rows) {
+          const key = String(row?.cache_key || '').trim();
+          if (key) {
+            targets.add(key);
+          }
+        }
+      }
+    }
+
+    if (targets.size === 0) {
+      return 0;
     }
 
     let patchedCount = 0;
-    for (const [, entry] of targets) {
-      patchedCount += applyUserRatingPatchToCacheEntry(
-        entry,
-        itemIds,
+    for (const targetCacheKey of targets) {
+      patchedCount += applyUserRatingPatchToCacheKey(
+        targetCacheKey,
+        ids,
         {
           userRating: normalizedRating,
           clearUserRating,
@@ -3049,33 +4609,20 @@ export async function buildServer(config = loadConfig()) {
     return patchedCount;
   }
 
-  function getCachedUserRatingForItem(entry, itemId) {
+  function getCachedUserRatingForItem(cacheKey, itemId) {
     const key = String(itemId || '').trim();
-    if (!key || !entry) {
+    if (!key || !cacheKey) {
       return null;
     }
 
-    const nowMs = Date.now();
-    pruneExpiredRatingOverrides(entry, nowMs);
-    const override = entry?.libraryState?.ratingOverrides?.get(key);
-    if (override && Number.isFinite(override.userRating)) {
-      return normalizePlexRatingInt(override.userRating);
+    const found = selectCachedItemRatingStmt.get({
+      cache_key: cacheKey,
+      rating_key: key,
+    });
+    if (!found || found.user_rating == null) {
+      return null;
     }
-
-    for (const collection of SEARCH_BROWSE_COLLECTIONS) {
-      const state = entry.collections?.[collection];
-      if (!Array.isArray(state?.data)) {
-        continue;
-      }
-
-      const found = state.data.find((item) => String(item?.ratingKey || '').trim() === key);
-      if (!found) {
-        continue;
-      }
-      return normalizePlexRatingInt(found.userRating);
-    }
-
-    return null;
+    return normalizePlexRatingInt(found.user_rating);
   }
 
   async function getLibraryFingerprint({ plexState }) {
@@ -3099,73 +4646,79 @@ export async function buildServer(config = loadConfig()) {
     return `${sectionPart}|${probe || ''}`;
   }
 
-  async function refreshSearchBrowseCollectionsForEntry({ entry, plexState, request }) {
-    await Promise.all(
-      SEARCH_BROWSE_COLLECTIONS.map((collection) =>
-        loadSearchBrowseCollection({
-          entry,
-          collection,
-          loader: getLibraryCollectionLoader(collection, plexState),
-          request,
-          background: false,
-        }),
-      ),
-    );
-    entry.libraryState.dirty = false;
+  async function refreshSearchBrowseCollectionsForCacheKey({ cacheKey, plexState, request }) {
+    for (const collection of SEARCH_BROWSE_COLLECTIONS) {
+      await loadSearchBrowseCollection({
+        cacheKey,
+        collection,
+        loader: getLibraryCollectionLoader(collection, plexState),
+        request,
+        background: false,
+      });
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const state = getPersistedLibraryCacheState(cacheKey);
+    state.lastSyncedAt = nowSeconds;
+    state.dirty = false;
+    persistLibraryCacheState(cacheKey, state, nowSeconds);
   }
 
   async function ensureDirtySearchBrowseRefresh({
-    entry,
     cacheKey,
     plexState,
     request,
     wait = false,
   }) {
-    if (!entry?.libraryState?.dirty) {
+    const state = getPersistedLibraryCacheState(cacheKey);
+    if (!state.dirty) {
       return;
     }
 
-    const libraryState = entry.libraryState;
-    if (!libraryState.refreshPromise) {
-      const pending = (async () => {
+    let pending = cacheRefreshInFlight.get(cacheKey);
+    if (!pending) {
+      pending = (async () => {
         try {
-          await refreshSearchBrowseCollectionsForEntry({ entry, plexState, request });
+          await refreshSearchBrowseCollectionsForCacheKey({ cacheKey, plexState, request });
         } catch (error) {
           request?.log?.warn(error, `Failed to refresh stale cache for ${cacheKey}`);
           throw error;
         } finally {
-          if (libraryState.refreshPromise === pending) {
-            libraryState.refreshPromise = null;
+          if (cacheRefreshInFlight.get(cacheKey) === pending) {
+            cacheRefreshInFlight.delete(cacheKey);
           }
         }
       })();
-      libraryState.refreshPromise = pending;
+      cacheRefreshInFlight.set(cacheKey, pending);
+      if (!wait) {
+        return;
+      }
     }
 
-    if (wait && libraryState.refreshPromise) {
+    if (wait && pending) {
       try {
-        await libraryState.refreshPromise;
+        await pending;
       } catch {
         // Keep serving stale cache on refresh failures.
       }
     }
   }
 
-  function maybeCheckLibraryChanges({ entry, cacheKey, plexState, request }) {
-    if (!request || !entry?.libraryState) {
+  function maybeCheckLibraryChanges({ cacheKey, plexState, request }) {
+    if (!request) {
       return;
     }
 
-    const libraryState = entry.libraryState;
+    const state = getPersistedLibraryCacheState(cacheKey);
     const now = Date.now();
-    if (libraryState.checking) {
+    if (cacheChangeCheckInFlight.has(cacheKey)) {
       return;
     }
-    if ((now - Number(libraryState.lastCheckedAt || 0)) < SEARCH_BROWSE_CHANGE_CHECK_DEBOUNCE_MS) {
+    if ((now - Number(state.lastCheckedAt || 0)) < SEARCH_BROWSE_CHANGE_CHECK_DEBOUNCE_MS) {
       return;
     }
 
-    libraryState.lastCheckedAt = now;
+    state.lastCheckedAt = now;
+    persistLibraryCacheState(cacheKey, state, Math.floor(now / 1000));
     const pending = (async () => {
       try {
         const fingerprint = await getLibraryFingerprint({ plexState });
@@ -3173,17 +4726,20 @@ export async function buildServer(config = loadConfig()) {
           return;
         }
 
-        if (!libraryState.lastFingerprint) {
-          libraryState.lastFingerprint = fingerprint;
+        const latestState = getPersistedLibraryCacheState(cacheKey);
+        if (!latestState.lastFingerprint) {
+          latestState.lastFingerprint = fingerprint;
+          persistLibraryCacheState(cacheKey, latestState);
           return;
         }
 
-        if (libraryState.lastFingerprint !== fingerprint) {
-          libraryState.lastFingerprint = fingerprint;
-          libraryState.dirty = true;
+        if (latestState.lastFingerprint !== fingerprint) {
+          latestState.lastFingerprint = fingerprint;
+          latestState.dirty = true;
+          latestState.lastSyncedAt = 0;
+          persistLibraryCacheState(cacheKey, latestState);
           request.log.info({ cacheKey }, 'Plex library change detected, refreshing cache');
           await ensureDirtySearchBrowseRefresh({
-            entry,
             cacheKey,
             plexState,
             request,
@@ -3193,19 +4749,12 @@ export async function buildServer(config = loadConfig()) {
       } catch (error) {
         request.log.debug(error, `Failed to check library changes for ${cacheKey}`);
       } finally {
-        if (libraryState.checking === pending) {
-          libraryState.checking = null;
+        if (cacheChangeCheckInFlight.get(cacheKey) === pending) {
+          cacheChangeCheckInFlight.delete(cacheKey);
         }
       }
     })();
-    libraryState.checking = pending;
-  }
-
-  function hasCachedLibraryData(entry) {
-    if (!entry?.collections) {
-      return false;
-    }
-    return SEARCH_BROWSE_COLLECTIONS.some((collection) => Array.isArray(entry.collections?.[collection]?.data));
+    cacheChangeCheckInFlight.set(cacheKey, pending);
   }
 
   function shouldRunLibraryCheckForRequest(request, cacheKey) {
@@ -3230,46 +4779,359 @@ export async function buildServer(config = loadConfig()) {
 
   async function getSearchBrowseCollection({ cacheKey, collection, loader, plexState, request = null }) {
     const now = Date.now();
-    const entry = getSearchBrowseCacheEntry(cacheKey, now);
-    const state = getSearchBrowseCollectionState(entry, collection);
 
-    if (hasCachedLibraryData(entry) && shouldRunLibraryCheckForRequest(request, cacheKey)) {
-      maybeCheckLibraryChanges({ entry, cacheKey, plexState, request });
+    if (hasSearchBrowseCollectionPersistedData(cacheKey) && shouldRunLibraryCheckForRequest(request, cacheKey)) {
+      maybeCheckLibraryChanges({ cacheKey, plexState, request });
     }
     await ensureDirtySearchBrowseRefresh({
-      entry,
       cacheKey,
       plexState,
       request,
       wait: true,
     });
 
-    if (Array.isArray(state.data)) {
-      const isStale = (now - Number(state.loadedAt || 0)) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
-      const canRefresh = (now - Number(state.lastRefreshAt || 0)) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
-      if (isStale && canRefresh && !state.loading) {
-        void loadSearchBrowseCollection({
-          entry,
+    const cached = readSearchBrowseCollectionFromSqlite(cacheKey, collection);
+    if (Array.isArray(cached)) {
+      const state = getPersistedLibraryCacheState(cacheKey);
+      const lastSyncedMs = Number(state.lastSyncedAt || 0) * 1000;
+      const isStale = lastSyncedMs <= 0 || (now - lastSyncedMs) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
+      if (isStale) {
+        loadSearchBrowseCollection({
+          cacheKey,
           collection,
           loader,
           request,
           background: true,
+        }).catch((error) => {
+          request?.log?.debug?.(error, `Background refresh scheduling failed for ${collection} cache`);
         });
       }
-      return state.data;
+      return cached;
     }
 
-    if (state.loading) {
-      return state.loading;
+    if (hasPersistedCollectionData(cacheKey, collection)) {
+      return [];
     }
 
     return loadSearchBrowseCollection({
-      entry,
+      cacheKey,
       collection,
       loader,
       request,
       background: false,
     });
+  }
+
+  function searchSqlParams(cacheKey, query, limit, offset) {
+    const normalizedQuery = safeLower(String(query || '').trim());
+    return {
+      cache_key: cacheKey,
+      query: normalizedQuery,
+      pattern: `%${normalizedQuery}%`,
+      limit: Math.max(0, Number.parseInt(String(limit ?? 0), 10) || 0),
+      offset: Math.max(0, Number.parseInt(String(offset ?? 0), 10) || 0),
+    };
+  }
+
+  function numericTotal(value) {
+    return parseNonNegativeInt(value, 0);
+  }
+
+  async function ensureSearchBrowseCollectionReady({
+    accountId,
+    plexState,
+    request = null,
+    collection,
+  }) {
+    if (!SEARCH_BROWSE_COLLECTIONS.includes(collection)) {
+      throw new Error(`Unsupported cache collection: ${collection}`);
+    }
+
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    const now = Date.now();
+
+    if (hasSearchBrowseCollectionPersistedData(cacheKey) && shouldRunLibraryCheckForRequest(request, cacheKey)) {
+      maybeCheckLibraryChanges({ cacheKey, plexState, request });
+    }
+    await ensureDirtySearchBrowseRefresh({
+      cacheKey,
+      plexState,
+      request,
+      wait: true,
+    });
+
+    if (!hasPersistedCollectionData(cacheKey, collection)) {
+      await loadSearchBrowseCollection({
+        cacheKey,
+        collection,
+        loader: getLibraryCollectionLoader(collection, plexState),
+        request,
+        background: false,
+      });
+      return cacheKey;
+    }
+
+    const state = getPersistedLibraryCacheState(cacheKey);
+    const lastSyncedMs = Number(state.lastSyncedAt || 0) * 1000;
+    const isStale = lastSyncedMs <= 0 || (now - lastSyncedMs) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
+    if (isStale) {
+      loadSearchBrowseCollection({
+        cacheKey,
+        collection,
+        loader: getLibraryCollectionLoader(collection, plexState),
+        request,
+        background: true,
+      }).catch((error) => {
+        request?.log?.debug?.(error, `Background refresh scheduling failed for ${collection} cache`);
+      });
+    }
+
+    return cacheKey;
+  }
+
+  function trackFromCacheRowWithRelations(cacheKey, row) {
+    const ratingKey = String(row?.rating_key || '').trim();
+    if (!ratingKey) {
+      return trackFromCacheRow(row);
+    }
+    const relations = trackRelationsByRatingKey(cacheKey, ratingKey);
+    return trackFromCacheRow(row, {
+      genreNames: relations.genres,
+      artists: relations.artists,
+      albumArtists: relations.albumArtists,
+    });
+  }
+
+  function albumFromCacheRowWithRelations(cacheKey, row) {
+    const ratingKey = String(row?.rating_key || '').trim();
+    return albumFromCacheRow(row, ratingKey ? albumGenresByRatingKey(cacheKey, ratingKey) : []);
+  }
+
+  async function queryArtistsBySearch({
+    accountId,
+    plexState,
+    request,
+    query,
+    count,
+    offset,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'artists',
+    });
+    const params = searchSqlParams(cacheKey, query, count, offset);
+    const total = numericTotal(countArtistsByQueryStmt.get(params)?.total);
+    if (params.limit <= 0) {
+      return { total, items: [] };
+    }
+    const items = selectArtistsPageByQueryStmt.all(params).map((row) => artistFromCacheRow(row));
+    return { total, items };
+  }
+
+  async function queryAlbumsBySearch({
+    accountId,
+    plexState,
+    request,
+    query,
+    count,
+    offset,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'albums',
+    });
+    const params = searchSqlParams(cacheKey, query, count, offset);
+    const total = numericTotal(countAlbumsByQueryStmt.get(params)?.total);
+    if (params.limit <= 0) {
+      return { total, items: [] };
+    }
+    const rows = selectAlbumsPageByQueryStmt.all(params);
+    const items = rows.map((row) => albumFromCacheRowWithRelations(cacheKey, row));
+    return { total, items };
+  }
+
+  async function queryTracksBySearch({
+    accountId,
+    plexState,
+    request,
+    query,
+    count,
+    offset,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+    });
+    const params = searchSqlParams(cacheKey, query, count, offset);
+    const total = numericTotal(countTracksByQueryStmt.get(params)?.total);
+    if (params.limit <= 0) {
+      return { total, items: [] };
+    }
+    const rows = selectTracksPageByQueryStmt.all(params);
+    const items = rows.map((row) => trackFromCacheRowWithRelations(cacheKey, row));
+    return { total, items };
+  }
+
+  async function queryTracksByGenre({
+    accountId,
+    plexState,
+    request,
+    genre,
+    count,
+    offset,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+    });
+    const params = {
+      cache_key: cacheKey,
+      genre: String(genre || ''),
+      limit: Math.max(0, Number.parseInt(String(count ?? 0), 10) || 0),
+      offset: Math.max(0, Number.parseInt(String(offset ?? 0), 10) || 0),
+    };
+    const total = numericTotal(countTracksByGenreStmt.get(params)?.total);
+    if (params.limit <= 0) {
+      return { total, items: [] };
+    }
+    const rows = selectTracksByGenreStmt.all(params);
+    const items = rows.map((row) => trackFromCacheRowWithRelations(cacheKey, row));
+    return { total, items };
+  }
+
+  async function queryGenreSummaries({
+    accountId,
+    plexState,
+    request,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+    });
+    const rows = selectGenreSummaryRowsStmt.all(cacheKey);
+    return rows.map((row) => ({
+      value: firstNonEmptyText([row?.genre_name], ''),
+      songCount: numericTotal(row?.song_count),
+      albumCount: numericTotal(row?.album_count),
+    }))
+      .filter((item) => Boolean(item.value));
+  }
+
+  function albumListStatementsByType(type, fromYear, toYear) {
+    switch (type) {
+      case 'alphabeticalbyartist':
+        return {
+          selectStmt: selectAlbumsAlphabeticalByArtistStmt,
+          countStmt: countAlbumsAlphabeticalByArtistStmt,
+          params: {},
+        };
+      case 'newest':
+        return {
+          selectStmt: selectAlbumsNewestStmt,
+          countStmt: countAlbumsNewestStmt,
+          params: {},
+        };
+      case 'highest':
+        return {
+          selectStmt: selectAlbumsHighestStmt,
+          countStmt: countAlbumsHighestStmt,
+          params: {},
+        };
+      case 'frequent':
+        return {
+          selectStmt: selectAlbumsFrequentStmt,
+          countStmt: countAlbumsFrequentStmt,
+          params: {},
+        };
+      case 'recent':
+        return {
+          selectStmt: selectAlbumsRecentStmt,
+          countStmt: countAlbumsRecentStmt,
+          params: {},
+        };
+      case 'starred':
+        return {
+          selectStmt: selectAlbumsStarredStmt,
+          countStmt: countAlbumsStarredStmt,
+          params: {},
+        };
+      case 'random':
+        return {
+          selectStmt: selectAlbumsRandomStmt,
+          countStmt: countAlbumsRandomStmt,
+          params: {},
+        };
+      case 'byyear': {
+        const yearLow = Math.min(fromYear, toYear);
+        const yearHigh = Math.max(fromYear, toYear);
+        const descending = fromYear > toYear;
+        return {
+          selectStmt: descending ? selectAlbumsByYearDescStmt : selectAlbumsByYearAscStmt,
+          countStmt: countAlbumsByYearStmt,
+          params: {
+            year_low: yearLow,
+            year_high: yearHigh,
+          },
+        };
+      }
+      case 'bygenre':
+        return {
+          selectStmt: selectAlbumsByGenreStmt,
+          countStmt: countAlbumsByGenreStmt,
+          params: {},
+        };
+      case 'alphabeticalbyname':
+      default:
+        return {
+          selectStmt: selectAlbumsAlphabeticalByNameStmt,
+          countStmt: countAlbumsAlphabeticalByNameStmt,
+          params: {},
+        };
+    }
+  }
+
+  async function queryAlbumListFromCache({
+    accountId,
+    plexState,
+    request,
+    type,
+    fromYear,
+    toYear,
+    genre,
+    size,
+    offset,
+  }) {
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'albums',
+    });
+    const selected = albumListStatementsByType(type, fromYear, toYear);
+    const params = {
+      cache_key: cacheKey,
+      limit: Math.max(0, Number.parseInt(String(size ?? 0), 10) || 0),
+      offset: Math.max(0, Number.parseInt(String(offset ?? 0), 10) || 0),
+      genre: String(genre || ''),
+      ...selected.params,
+    };
+    const total = numericTotal(selected.countStmt.get(params)?.total);
+    if (params.limit <= 0) {
+      return { total, items: [] };
+    }
+    const rows = selected.selectStmt.all(params);
+    const items = rows.map((row) => albumFromCacheRowWithRelations(cacheKey, row));
+    return { total, items };
   }
 
   async function getCachedLibraryArtists({ accountId, plexState, request }) {
@@ -3303,6 +5165,396 @@ export async function buildServer(config = loadConfig()) {
       request,
       loader: () => loadLibraryTracksRaw({ plexState }),
     });
+  }
+
+  async function recoverWarmupPlexState({ accountId, fallbackState, request = null }) {
+    const logger = request?.log || app.log;
+    const currentContext = repo.getAccountPlexContext(accountId);
+    if (!hasPlexSelectionContext(currentContext)) {
+      return null;
+    }
+
+    const existingState = buildPlexStateFromContext(currentContext, tokenCipher) || fallbackState;
+    if (!existingState?.baseUrl || !existingState?.machineId) {
+      return null;
+    }
+
+    const pickSectionAndPersist = async ({ baseUrl, plexToken }) => {
+      const sections = await listMusicSections({
+        baseUrl,
+        plexToken,
+      });
+      const chosen = chooseRecoverableMusicSection(
+        sections,
+        currentContext.music_section_id,
+        currentContext.music_section_name,
+      );
+      if (!chosen) {
+        return null;
+      }
+      const chosenId = String(chosen.id || '').trim();
+      if (!chosenId) {
+        return null;
+      }
+      if (chosenId !== String(currentContext.music_section_id || '').trim()) {
+        repo.upsertSelectedLibrary({
+          accountId,
+          musicSectionId: chosenId,
+          musicSectionName: chosen.title ? String(chosen.title) : null,
+        });
+      }
+      return chosen;
+    };
+
+    try {
+      const chosen = await pickSectionAndPersist({
+        baseUrl: existingState.baseUrl,
+        plexToken: existingState.plexToken,
+      });
+      if (chosen) {
+        const refreshed = repo.getAccountPlexContext(accountId);
+        const recoveredState = buildPlexStateFromContext(refreshed, tokenCipher);
+        if (recoveredState) {
+          return recoveredState;
+        }
+      }
+    } catch {
+      // Continue to server URL recovery path below.
+    }
+
+    let accountToken = null;
+    if (currentContext.plex_token_enc) {
+      try {
+        accountToken = decodePlexTokenOrThrow(tokenCipher, currentContext.plex_token_enc);
+      } catch { }
+    }
+    if (!accountToken) {
+      return null;
+    }
+
+    let resources;
+    try {
+      resources = await listPlexServers(config, accountToken);
+    } catch (error) {
+      logger.debug({ err: error, accountId }, 'Unable to list Plex resources for warm-up recovery');
+      return null;
+    }
+    const matched = (Array.isArray(resources) ? resources : [])
+      .find((resource) => String(resource?.machineId || '') === String(currentContext.machine_id || ''));
+    if (!matched) {
+      return null;
+    }
+
+    const candidateUrls = uniqueNonEmptyValues([
+      currentContext.server_base_url,
+      matched.baseUrl,
+      ...((Array.isArray(matched.connectionUris) ? matched.connectionUris : [])),
+    ]);
+    const candidateTokens = uniqueNonEmptyValues([
+      matched.accessToken,
+      ...(Array.isArray(existingState.plexToken) ? existingState.plexToken : []),
+      accountToken,
+    ]);
+
+    for (const candidateToken of candidateTokens) {
+      for (const candidateUrl of candidateUrls) {
+        try {
+          const chosen = await pickSectionAndPersist({
+            baseUrl: candidateUrl,
+            plexToken: candidateToken,
+          });
+          if (!chosen) {
+            continue;
+          }
+
+          const encryptedServerToken = candidateToken
+            ? tokenCipher.encrypt(String(candidateToken))
+            : currentContext.server_token_enc || null;
+          repo.upsertSelectedServer({
+            accountId,
+            machineId: String(currentContext.machine_id),
+            name: String(matched.name || currentContext.server_name || 'Plex Server'),
+            baseUrl: String(candidateUrl),
+            encryptedServerToken,
+          });
+
+          const refreshed = repo.getAccountPlexContext(accountId);
+          const recoveredState = buildPlexStateFromContext(refreshed, tokenCipher);
+          if (recoveredState) {
+            logger.info(
+              { accountId, machineId: currentContext.machine_id, baseUrl: candidateUrl, sectionId: chosen.id },
+              'Recovered Plex context for cache warm-up',
+            );
+            return recoveredState;
+          }
+        } catch {
+          // Try next candidate URL/token.
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async function warmLibraryCacheForAccount({
+    accountId,
+    plexState,
+    reason = 'manual',
+    request = null,
+    attemptRecovery = true,
+    forceRefresh = false,
+  }) {
+    if (!accountId || !plexState) {
+      return;
+    }
+    const cacheKey = searchBrowseCacheKey(accountId, plexState);
+    if (cacheWarmupInFlight.has(cacheKey)) {
+      return cacheWarmupInFlight.get(cacheKey);
+    }
+
+    const pending = (async () => {
+      try {
+        const collectionsToWarm = SEARCH_BROWSE_COLLECTIONS.filter((collection) =>
+          forceRefresh || !hasPersistedCollectionData(cacheKey, collection),
+        );
+        if (collectionsToWarm.length === 0) {
+          app.log.debug({ cacheKey, accountId, reason }, 'Library cache warm-up skipped (already populated)');
+          return;
+        }
+
+        const loaderCounts = {
+          artists: 0,
+          albums: 0,
+          tracks: 0,
+        };
+        for (const collection of collectionsToWarm) {
+          const loaded = await loadSearchBrowseCollection({
+            cacheKey,
+            collection,
+            loader: getLibraryCollectionLoader(collection, plexState),
+            request,
+            background: false,
+          });
+          loaderCounts[collection] = Array.isArray(loaded) ? loaded.length : 0;
+        }
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const state = getPersistedLibraryCacheState(cacheKey);
+        state.lastSyncedAt = Math.max(Number(state.lastSyncedAt || 0), nowSeconds);
+        state.dirty = false;
+        persistLibraryCacheState(cacheKey, state, nowSeconds);
+        app.log.info(
+          {
+            cacheKey,
+            accountId,
+            reason,
+            warmedCollections: collectionsToWarm,
+            artists: loaderCounts.artists,
+            albums: loaderCounts.albums,
+            tracks: loaderCounts.tracks,
+          },
+          'Library cache warm-up completed',
+        );
+      } catch (error) {
+        if (attemptRecovery) {
+          const recoveredState = await recoverWarmupPlexState({
+            accountId,
+            fallbackState: plexState,
+            request,
+          });
+          if (recoveredState) {
+            return warmLibraryCacheForAccount({
+              accountId,
+              plexState: recoveredState,
+              reason: `${reason}-recovered`,
+              request,
+              attemptRecovery: false,
+              forceRefresh,
+            });
+          }
+        }
+        const logger = request?.log || app.log;
+        logger.warn({ err: error, cacheKey, accountId, reason }, 'Library cache warm-up failed');
+      }
+    })();
+
+    cacheWarmupInFlight.set(cacheKey, pending);
+    pending.finally(() => {
+      if (cacheWarmupInFlight.get(cacheKey) === pending) {
+        cacheWarmupInFlight.delete(cacheKey);
+      }
+    });
+    return pending;
+  }
+
+  async function warmAllLinkedLibraryCaches(reason = 'startup') {
+    const contexts = repo.listAccountPlexContexts()
+      .filter((context) =>
+        Number(context?.enabled) === 1 &&
+        hasPlexSelectionContext(context),
+      );
+    for (const context of contexts) {
+      const plexState = buildPlexStateFromContext(context, tokenCipher);
+      if (!plexState) {
+        continue;
+      }
+      // Warm sequentially to cap memory spikes when multiple accounts share large libraries.
+      await warmLibraryCacheForAccount({
+        accountId: context.account_id,
+        plexState,
+        reason,
+        forceRefresh: false,
+      });
+    }
+  }
+
+  function cachedRowToCollectionItem(cacheKey, collection, row) {
+    if (!row) {
+      return null;
+    }
+    if (collection === 'artists') {
+      return artistFromCacheRow(row);
+    }
+    if (collection === 'albums') {
+      return albumFromCacheRowWithRelations(cacheKey, row);
+    }
+    if (collection === 'tracks') {
+      return trackFromCacheRowWithRelations(cacheKey, row);
+    }
+    return null;
+  }
+
+  function selectCollectionRowByIdentity(cacheKey, collection, id) {
+    const exact = String(id || '').trim();
+    if (!exact) {
+      return null;
+    }
+    const lowered = safeLower(exact);
+    const params = {
+      cache_key: cacheKey,
+      exact,
+      lowered,
+    };
+    if (collection === 'artists') {
+      return selectArtistRowByIdentityStmt.get(params) || null;
+    }
+    if (collection === 'albums') {
+      return selectAlbumRowByIdentityStmt.get(params) || null;
+    }
+    if (collection === 'tracks') {
+      return selectTrackRowByIdentityStmt.get(params) || null;
+    }
+    return null;
+  }
+
+  function selectCollectionRowByRatingKey(cacheKey, collection, ratingKey) {
+    const normalized = String(ratingKey || '').trim();
+    if (!normalized) {
+      return null;
+    }
+    if (collection === 'artists') {
+      return selectArtistRowByRatingKeyStmt.get(cacheKey, normalized) || null;
+    }
+    if (collection === 'albums') {
+      return selectAlbumRowByRatingKeyStmt.get(cacheKey, normalized) || null;
+    }
+    if (collection === 'tracks') {
+      return selectTrackRowByRatingKeyStmt.get(cacheKey, normalized) || null;
+    }
+    return null;
+  }
+
+  async function resolveCachedLibraryItemById({ accountId, plexState, request, collection, id }) {
+    const normalizedId = String(id || '').trim();
+    if (!normalizedId) {
+      return null;
+    }
+    if (!SEARCH_BROWSE_COLLECTIONS.includes(collection)) {
+      return null;
+    }
+
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection,
+    });
+    const metadataId = metadataPathRatingKey(normalizedId);
+    const numericCandidate = isNumericRatingKey(normalizedId) ? normalizedId : metadataId;
+    if (numericCandidate) {
+      const row = selectCollectionRowByRatingKey(cacheKey, collection, numericCandidate);
+      const item = cachedRowToCollectionItem(cacheKey, collection, row);
+      if (item) {
+        return item;
+      }
+    }
+
+    const directRow = selectCollectionRowByIdentity(cacheKey, collection, normalizedId);
+    if (directRow) {
+      const item = cachedRowToCollectionItem(cacheKey, collection, directRow);
+      if (item) {
+        return item;
+      }
+    }
+
+    const variants = [...comparableIdVariants(normalizedId)];
+    for (const variant of variants) {
+      const row = selectCollectionRowByIdentity(cacheKey, collection, variant);
+      if (row) {
+        const item = cachedRowToCollectionItem(cacheKey, collection, row);
+        if (item) {
+          return item;
+        }
+      }
+    }
+
+    const fallbackItems = readSearchBrowseCollectionFromSqlite(cacheKey, collection) || [];
+    return findItemByRequestedId(fallbackItems, normalizedId);
+  }
+
+  async function resolveCachedLibraryRatingKey({ accountId, plexState, request, collection, id }) {
+    const normalizedId = String(id || '').trim();
+    if (!normalizedId) {
+      return '';
+    }
+    if (isNumericRatingKey(normalizedId)) {
+      return normalizedId;
+    }
+
+    const metadataId = metadataPathRatingKey(normalizedId);
+    if (metadataId) {
+      return metadataId;
+    }
+
+    const item = await resolveCachedLibraryItemById({
+      accountId,
+      plexState,
+      request,
+      collection,
+      id: normalizedId,
+    });
+    return String(item?.ratingKey || '').trim();
+  }
+
+  async function resolveCachedLibraryRatingKeyAnyCollection({
+    accountId,
+    plexState,
+    request,
+    id,
+    collections = ['tracks', 'albums', 'artists'],
+  }) {
+    for (const collection of collections) {
+      const resolved = await resolveCachedLibraryRatingKey({
+        accountId,
+        plexState,
+        request,
+        collection,
+        id,
+      });
+      if (resolved) {
+        return resolved;
+      }
+    }
+    return '';
   }
 
   function pruneSavedPlayQueues(now = Date.now()) {
@@ -3341,12 +5593,41 @@ export async function buildServer(config = loadConfig()) {
       return [];
     }
 
-    const tracks = await getCachedLibraryTracks({ accountId, plexState, request });
+    const cacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+    });
     const cachedById = new Map();
-    for (const track of tracks) {
-      const ratingKey = String(track?.ratingKey || '').trim();
+    for (const id of orderedIds) {
+      const metadataId = metadataPathRatingKey(id);
+      let row = selectTrackRowByRatingKeyStmt.get(cacheKey, id) ||
+        (metadataId ? selectTrackRowByRatingKeyStmt.get(cacheKey, metadataId) : null) ||
+        selectTrackRowByIdentityStmt.get({
+          cache_key: cacheKey,
+          exact: id,
+          lowered: safeLower(id),
+        });
+      if (!row) {
+        for (const variant of comparableIdVariants(id)) {
+          row = selectTrackRowByIdentityStmt.get({
+            cache_key: cacheKey,
+            exact: variant,
+            lowered: safeLower(variant),
+          });
+          if (row) {
+            break;
+          }
+        }
+      }
+      if (!row) {
+        continue;
+      }
+      const mapped = trackFromCacheRowWithRelations(cacheKey, row);
+      const ratingKey = String(mapped?.ratingKey || '').trim();
       if (ratingKey && !cachedById.has(ratingKey)) {
-        cachedById.set(ratingKey, track);
+        cachedById.set(ratingKey, mapped);
       }
     }
 
@@ -3394,11 +5675,35 @@ export async function buildServer(config = loadConfig()) {
       return 0;
     }
     const cacheKey = searchBrowseCacheKey(accountId, plexState);
-    const entry = searchBrowseCache.get(cacheKey);
-    if (!entry) {
-      return 0;
+    let patched = 0;
+    for (const item of items) {
+      const ratingKey = String(item?.ratingKey || '').trim();
+      if (!ratingKey) {
+        continue;
+      }
+      const found = selectCachedItemRatingStmt.get({
+        cache_key: cacheKey,
+        rating_key: ratingKey,
+      });
+      if (!found || found.user_rating == null) {
+        continue;
+      }
+      const normalized = normalizePlexRating(found.user_rating);
+      if (normalized == null) {
+        continue;
+      }
+      item.userRating = normalized;
+      const updatedAt = Number.parseInt(String(found.updated_at ?? ''), 10);
+      if (Number.isFinite(updatedAt) && updatedAt > 0) {
+        item.updatedAt = updatedAt;
+      }
+      if (!isPlexLiked(item.userRating)) {
+        delete item.starred;
+        delete item.starredAt;
+      }
+      patched += 1;
     }
-    return applyRatingOverridesToItems(entry, items, Date.now());
+    return patched;
   }
 
   async function resolveArtistFromCachedLibrary({ accountId, plexState, request, artistId }) {
@@ -3406,39 +5711,128 @@ export async function buildServer(config = loadConfig()) {
     if (!normalizedArtistId) {
       return null;
     }
-
-    const [artists, albums, tracks] = await Promise.all([
-      getCachedLibraryArtists({ accountId, plexState, request }),
-      getCachedLibraryAlbums({ accountId, plexState, request }),
-      getCachedLibraryTracks({ accountId, plexState, request }),
+    const [artistCacheKey, albumCacheKey, trackCacheKey] = await Promise.all([
+      ensureSearchBrowseCollectionReady({ accountId, plexState, request, collection: 'artists' }),
+      ensureSearchBrowseCollectionReady({ accountId, plexState, request, collection: 'albums' }),
+      ensureSearchBrowseCollectionReady({ accountId, plexState, request, collection: 'tracks' }),
     ]);
 
-    const cachedArtist = artists.find((item) => String(item?.ratingKey || '').trim() === normalizedArtistId) || null;
-    const cachedAlbums = albums.filter((item) => String(item?.parentRatingKey || '').trim() === normalizedArtistId);
-    const artistTracks = tracks.filter((item) => String(item?.grandparentRatingKey || '').trim() === normalizedArtistId);
+    let cachedArtist = await resolveCachedLibraryItemById({
+      accountId,
+      plexState,
+      request,
+      collection: 'artists',
+      id: normalizedArtistId,
+    });
+    const numericArtistId = isNumericRatingKey(normalizedArtistId)
+      ? normalizedArtistId
+      : metadataPathRatingKey(normalizedArtistId);
 
-    if (!cachedArtist && cachedAlbums.length === 0 && artistTracks.length === 0) {
+    let trackRows = [];
+    const resolvedArtistIdHint = String(cachedArtist?.ratingKey || numericArtistId || '').trim();
+    if (resolvedArtistIdHint) {
+      trackRows = selectTracksByGrandparentRatingKeyStmt.all(trackCacheKey, resolvedArtistIdHint);
+    }
+    if (trackRows.length === 0) {
+      trackRows = selectTracksByGrandparentTitleStmt.all(trackCacheKey, normalizedArtistId);
+    }
+    const artistTracks = trackRows.map((row) => trackFromCacheRowWithRelations(trackCacheKey, row));
+    const artistNameFromTracks = firstNonEmptyText(
+      artistTracks.map((item) => trackPrimaryArtistName(item)),
+      '',
+    );
+    if (!cachedArtist && artistNameFromTracks) {
+      const row = selectArtistRowByTitleStmt.get(artistCacheKey, artistNameFromTracks);
+      if (row) {
+        cachedArtist = artistFromCacheRow(row);
+      }
+    }
+
+    const resolvedArtistId = String(
+      cachedArtist?.ratingKey ||
+      trackPrimaryArtistId(artistTracks[0]) ||
+      artistTracks[0]?.grandparentRatingKey ||
+      numericArtistId ||
+      normalizedArtistId,
+    ).trim();
+    const effectiveArtistName = cachedArtist?.title || artistNameFromTracks || normalizedArtistId;
+
+    let albumRows = [];
+    if (resolvedArtistId) {
+      albumRows = selectAlbumsByParentRatingKeyStmt.all(albumCacheKey, resolvedArtistId);
+    }
+    if (albumRows.length === 0 && effectiveArtistName) {
+      albumRows = selectAlbumsByParentTitleStmt.all(albumCacheKey, effectiveArtistName);
+    }
+    const resolvedAlbums = albumRows.length > 0
+      ? albumRows.map((row) => albumFromCacheRowWithRelations(albumCacheKey, row))
+      : deriveAlbumsFromTracks(artistTracks, resolvedArtistId, effectiveArtistName);
+
+    if (!cachedArtist && resolvedAlbums.length === 0 && artistTracks.length === 0) {
       return null;
     }
 
     const artistName = cachedArtist?.title ||
+      artistNameFromTracks ||
       firstNonEmptyText(artistTracks.map((item) => item?.grandparentTitle), `Artist ${normalizedArtistId}`);
-
     const artist = cachedArtist || {
-      ratingKey: normalizedArtistId,
+      ratingKey: resolvedArtistId,
       title: artistName,
       addedAt: artistTracks[0]?.addedAt,
       updatedAt: artistTracks[0]?.updatedAt,
     };
 
-    const resolvedAlbums = cachedAlbums.length > 0
-      ? cachedAlbums
-      : deriveAlbumsFromTracks(artistTracks, normalizedArtistId, artistName);
-
     return {
       artist,
       albums: resolvedAlbums,
     };
+  }
+
+  async function resolveAlbumFromCachedLibrary({ accountId, plexState, request, albumId }) {
+    const normalizedAlbumId = String(albumId || '').trim();
+    if (!normalizedAlbumId) {
+      return null;
+    }
+
+    const album = await resolveCachedLibraryItemById({
+      accountId,
+      plexState,
+      request,
+      collection: 'albums',
+      id: normalizedAlbumId,
+    });
+    if (!album) {
+      return null;
+    }
+
+    const trackCacheKey = await ensureSearchBrowseCollectionReady({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+    });
+    const resolvedAlbumId = String(album.ratingKey || '').trim();
+    const albumTracks = selectTracksByParentRatingKeyStmt
+      .all(trackCacheKey, resolvedAlbumId)
+      .map((row) => trackFromCacheRowWithRelations(trackCacheKey, row));
+    return {
+      album,
+      tracks: albumTracks,
+    };
+  }
+
+  async function resolveTrackFromCachedLibrary({ accountId, plexState, request, trackId }) {
+    const normalizedTrackId = String(trackId || '').trim();
+    if (!normalizedTrackId) {
+      return null;
+    }
+    return resolveCachedLibraryItemById({
+      accountId,
+      plexState,
+      request,
+      collection: 'tracks',
+      id: normalizedTrackId,
+    });
   }
 
   function scanStatusAttrsFromSection(section, { fallbackScanning = false } = {}) {
@@ -3514,8 +5908,7 @@ export async function buildServer(config = loadConfig()) {
     };
   }
 
-  function pruneRecentScrobbles(now = Date.now()) {
-    void now;
+  function pruneRecentScrobbles() {
     for (const [key, value] of recentScrobblesByClient.entries()) {
       if (!value) {
         recentScrobblesByClient.delete(key);
@@ -3568,12 +5961,12 @@ export async function buildServer(config = loadConfig()) {
     const { state } = getPlaybackContinuityState(accountId, clientName);
     state.at = now;
     state.trackId = String(trackId || '').trim();
-    pruneRecentScrobbles(now);
+    pruneRecentScrobbles();
   }
 
   function shouldSuppressPlaybackSyncForStreamLoad({ accountId, clientName, trackId }) {
     const now = Date.now();
-    pruneRecentScrobbles(now);
+    pruneRecentScrobbles();
 
     const { playbackClient, state: recent } = getPlaybackContinuityState(accountId, clientName);
     const current = playbackSessions.get(playbackClient.sessionKey);
@@ -4466,6 +6859,20 @@ export async function buildServer(config = loadConfig()) {
       musicSectionName: choice.title ? String(choice.title) : null,
     });
 
+    const context = repo.getAccountPlexContext(account.id);
+    const plexState = buildPlexStateFromContext(context, tokenCipher);
+    if (plexState) {
+      warmLibraryCacheForAccount({
+        accountId: account.id,
+        plexState,
+        reason: 'library-selected',
+        request,
+        forceRefresh: true,
+      }).catch((error) => {
+        request.log.warn(error, 'Library cache warm-up after library selection failed');
+      });
+    }
+
     return reply.redirect('/test');
   });
 
@@ -4831,42 +7238,11 @@ export async function buildServer(config = loadConfig()) {
       }
 
       try {
-        const [albums, tracks] = await Promise.all([
-          getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
-          getCachedLibraryTracks({ accountId: account.id, plexState, request }),
-        ]);
-
-        const albumGenreTagMap = buildAlbumGenreTagMap(albums);
-        const counts = new Map();
-        for (const track of tracks) {
-          const albumId = String(track?.parentRatingKey || '').trim();
-          for (const tag of resolvedGenreTagsForTrack(track, albumGenreTagMap)) {
-            const normalized = tag.trim();
-            if (!normalized) {
-              continue;
-            }
-            const key = safeLower(normalized);
-            const current = counts.get(key) || {
-              name: normalized,
-              songCount: 0,
-              albumIds: new Set(),
-            };
-            current.songCount += 1;
-            if (albumId) {
-              current.albumIds.add(albumId);
-            }
-            counts.set(key, current);
-          }
-        }
-
-        const genreItems = [...counts.values()]
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map((genre) => ({
-            songCount: genre.songCount,
-            albumCount: genre.albumIds.size,
-            value: genre.name,
-          }));
-
+        const genreItems = await queryGenreSummaries({
+          accountId: account.id,
+          plexState,
+          request,
+        });
         return sendSubsonicOk(reply, { genres: genreItems });
       } catch (error) {
         request.log.error(error, 'Failed to load genres');
@@ -4899,23 +7275,16 @@ export async function buildServer(config = loadConfig()) {
       }
 
       try {
-        const [albums, tracks] = await Promise.all([
-          getCachedLibraryAlbums({ accountId: account.id, plexState, request }),
-          getCachedLibraryTracks({ accountId: account.id, plexState, request }),
-        ]);
-
-        const targetGenre = safeLower(genre);
-        const albumGenreTagMap = buildAlbumGenreTagMap(albums);
-        const matchedSongs = tracks.filter((track) =>
-          resolvedGenreTagsForTrack(track, albumGenreTagMap).some(
-            (tag) => safeLower(String(tag || '').trim()) === targetGenre,
-          ),
-        );
-
-        const sortedSongs = sortTracksForLibraryBrowse(matchedSongs);
-        const page = takePage(sortedSongs, offset, count)
-          .map((track) => withResolvedTrackGenres(track, albumGenreTagMap));
-        const songs = page.map((track) => songJson(track));
+        const { total, items } = await queryTracksByGenre({
+          accountId: account.id,
+          plexState,
+          request,
+          genre,
+          count,
+          offset,
+        });
+        reply.header('x-total-count', String(total));
+        const songs = items.map((track) => songJson(track));
         return sendSubsonicOk(reply, { songsByGenre: songs });
       } catch (error) {
         request.log.error(error, 'Failed to load songs by genre');
@@ -5166,8 +7535,8 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const id = getRequestParam(request, 'id');
-    if (!id) {
+    const rawId = String(getRequestParam(request, 'id') || '').trim();
+    if (!rawId) {
       return sendSubsonicError(reply, 70, 'Missing song id');
     }
 
@@ -5178,11 +7547,26 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const resolvedTrackId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'tracks',
+        id: rawId,
+      }) || rawId;
       let track = await getTrack({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
-        trackId: id,
+        trackId: resolvedTrackId,
       });
+      if (!track) {
+        track = await resolveTrackFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          trackId: rawId,
+        });
+      }
       if (!track) {
         return sendSubsonicError(reply, 70, 'Song not found');
       }
@@ -5341,8 +7725,8 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
-      const id = getRequestParam(request, 'id');
-      if (!id) {
+      const rawId = String(getRequestParam(request, 'id') || '').trim();
+      if (!rawId) {
         return sendSubsonicError(reply, 10, 'Required parameter is missing');
       }
 
@@ -5354,10 +7738,17 @@ export async function buildServer(config = loadConfig()) {
       const lyricsScope = beginSearchRequest(request, account.id);
 
       try {
+        const resolvedTrackId = await resolveCachedLibraryRatingKey({
+          accountId: account.id,
+          plexState,
+          request,
+          collection: 'tracks',
+          id: rawId,
+        }) || rawId;
         const track = await getTrack({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          trackId: id,
+          trackId: resolvedTrackId,
           signal: lyricsScope.signal,
         });
 
@@ -5368,7 +7759,7 @@ export async function buildServer(config = loadConfig()) {
         const lyricCandidates = await fetchPlexTrackLyricsCandidates({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          trackId: id,
+          trackId: resolvedTrackId,
           signal: lyricsScope.signal,
         });
 
@@ -5438,68 +7829,85 @@ export async function buildServer(config = loadConfig()) {
       if (!hasValidMusicFolder) {
         request.log.debug(
           { musicFolderId, expected: String(plexState.musicSectionId || '') },
-          'Ignoring non-matching musicFolderId in search3',
+          'Returning empty search3 for non-matching musicFolderId',
         );
+        reply.header('x-total-artists', '0');
+        reply.header('x-total-albums', '0');
+        reply.header('x-total-songs', '0');
+        reply.header('x-total-count', '0');
+        return sendSubsonicOk(reply, {
+          searchResult3: {
+            artist: [],
+            album: [],
+            song: [],
+          },
+        });
       }
 
       const searchScope = beginSearchRequest(request, account.id);
 
       try {
-        let matchedArtists = [];
-        let matchedAlbums = [];
-        let matchedTracks = [];
+        const [artistSearch, albumSearch, trackSearch] = await Promise.all([
+          artistCount > 0
+            ? queryArtistsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: artistCount,
+              offset: artistOffset,
+            })
+            : { total: 0, items: [] },
+          albumCount > 0
+            ? queryAlbumsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: albumCount,
+              offset: albumOffset,
+            })
+            : { total: 0, items: [] },
+          songCount > 0
+            ? queryTracksBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: songCount,
+              offset: songOffset,
+            })
+            : { total: 0, items: [] },
+        ]);
 
-        if (!query) {
-          const [artists, albums, tracks] = await Promise.all([
-            artistCount > 0
-              ? getCachedLibraryArtists({ accountId: account.id, plexState, request })
-              : [],
-            albumCount > 0
-              ? getCachedLibraryAlbums({ accountId: account.id, plexState, request })
-              : [],
-            songCount > 0
-              ? getCachedLibraryTracks({ accountId: account.id, plexState, request })
-              : [],
-          ]);
+        let matchedArtists = artistSearch.items;
+        const matchedAlbums = albumSearch.items;
+        const matchedTracks = trackSearch.items;
 
-          matchedArtists = takePage(artists, artistOffset, artistCount);
-          matchedAlbums = takePage(albums, albumOffset, albumCount);
-          matchedTracks = takePage(tracks, songOffset, songCount);
-        } else {
-          const artistWindow = searchWindowSize(artistOffset, artistCount);
-          const albumWindow = searchWindowSize(albumOffset, albumCount);
-          const songWindow = searchWindowSize(songOffset, songCount);
-
-          const { artists, albums, tracks } = await runPlexSearch({
+        if (query && artistCount > 0 && matchedArtists.length === 0) {
+          const fallbackTracks = await queryTracksBySearch({
+            accountId: account.id,
             plexState,
+            request,
             query,
-            artistWindow,
-            albumWindow,
-            songWindow,
-            signal: searchScope.signal,
+            count: Math.min(500, Math.max(artistCount * 10, 100)),
+            offset: 0,
           });
-
-          const filteredArtists = artists.filter((artist) => includesText(artist.title, query));
-          const filteredAlbums = albums.filter((album) => includesText(album.title, query) || includesText(album.parentTitle, query));
-          const filteredTracks = tracks.filter((track) => includesText(track.title, query) || includesText(track.grandparentTitle, query));
-
-          // Plex search can return fuzzy-ranked items where title match is not strict.
-          // If strict filtering erases everything, fall back to Plex-ranked results.
-          const artistSource = (filteredArtists.length > 0 || artists.length === 0) ? filteredArtists : artists;
-          const albumSource = (filteredAlbums.length > 0 || albums.length === 0) ? filteredAlbums : albums;
-          const trackSource = (filteredTracks.length > 0 || tracks.length === 0) ? filteredTracks : tracks;
-
-          matchedArtists = takePage(artistSource, artistOffset, artistCount);
-          matchedAlbums = takePage(albumSource, albumOffset, albumCount);
-          matchedTracks = takePage(trackSource, songOffset, songCount);
+          const virtualArtists = deriveVirtualArtistsFromTracks(fallbackTracks.items, query);
+          matchedArtists = takePage(virtualArtists, artistOffset, artistCount);
         }
+
+        reply.header('x-total-artists', String(artistSearch.total));
+        reply.header('x-total-albums', String(albumSearch.total));
+        reply.header('x-total-songs', String(trackSearch.total));
+        reply.header('x-total-count', String(trackSearch.total));
 
         const artistItems = matchedArtists
           .map((artist) => ({
             id: artist.ratingKey,
             name: artist.title,
             albumCount: artistAlbumCountValue(artist),
-            coverArt: artist.ratingKey,
+            coverArt: firstNonEmptyText([artist?.thumb, artist?.ratingKey], undefined),
             ...subsonicRatingAttrs(artist),
           }));
         const albumItems = matchedAlbums
@@ -5507,10 +7915,11 @@ export async function buildServer(config = loadConfig()) {
         const songItems = matchedTracks
           .map((track) => songJson(track));
 
-        const searchResult3 = {};
-        assignNonEmptyBucket(searchResult3, 'artist', artistItems);
-        assignNonEmptyBucket(searchResult3, 'album', albumItems);
-        assignNonEmptyBucket(searchResult3, 'song', songItems);
+        const searchResult3 = {
+          artist: artistItems,
+          album: albumItems,
+          song: songItems,
+        };
         return sendSubsonicOk(reply, { searchResult3 });
       } catch (error) {
         if (isAbortError(error)) {
@@ -5562,40 +7971,65 @@ export async function buildServer(config = loadConfig()) {
       const searchScope = beginSearchRequest(request, account.id);
 
       try {
-        const artistWindow = searchWindowSize(artistOffset, artistCount);
-        const albumWindow = searchWindowSize(albumOffset, albumCount);
-        const songWindow = searchWindowSize(songOffset, songCount);
+        const [artistSearch, albumSearch, trackSearch] = await Promise.all([
+          artistCount > 0
+            ? queryArtistsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: artistCount,
+              offset: artistOffset,
+            })
+            : { total: 0, items: [] },
+          albumCount > 0
+            ? queryAlbumsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: albumCount,
+              offset: albumOffset,
+            })
+            : { total: 0, items: [] },
+          songCount > 0
+            ? queryTracksBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: songCount,
+              offset: songOffset,
+            })
+            : { total: 0, items: [] },
+        ]);
 
-        const { artists, albums, tracks } = await runPlexSearch({
-          plexState,
-          query,
-          artistWindow,
-          albumWindow,
-          songWindow,
-          signal: searchScope.signal,
-        });
+        let matchedArtists = artistSearch.items;
+        const matchedAlbums = albumSearch.items;
+        const matchedTracks = trackSearch.items;
+        if (artistCount > 0 && matchedArtists.length === 0) {
+          const fallbackTracks = await queryTracksBySearch({
+            accountId: account.id,
+            plexState,
+            request,
+            query,
+            count: Math.min(500, Math.max(artistCount * 10, 100)),
+            offset: 0,
+          });
+          const virtualArtists = deriveVirtualArtistsFromTracks(fallbackTracks.items, query);
+          matchedArtists = takePage(virtualArtists, artistOffset, artistCount);
+        }
 
-        const matchedArtists = takePage(
-          artists.filter((artist) => includesText(artist.title, query)),
-          artistOffset,
-          artistCount,
-        );
-        const matchedAlbums = takePage(
-          albums.filter((album) => includesText(album.title, query) || includesText(album.parentTitle, query)),
-          albumOffset,
-          albumCount,
-        );
-        const matchedTracks = takePage(
-          tracks.filter((track) => includesText(track.title, query) || includesText(track.grandparentTitle, query)),
-          songOffset,
-          songCount,
-        );
+        reply.header('x-total-artists', String(artistSearch.total));
+        reply.header('x-total-albums', String(albumSearch.total));
+        reply.header('x-total-songs', String(trackSearch.total));
+        reply.header('x-total-count', String(trackSearch.total));
 
         const artistItems = matchedArtists
           .map((artist) => ({
             id: artist.ratingKey,
             name: artist.title,
-            coverArt: artist.ratingKey,
+            coverArt: firstNonEmptyText([artist?.thumb, artist?.ratingKey], undefined),
             ...subsonicRatingAttrs(artist),
           }));
         const albumItems = matchedAlbums
@@ -5658,40 +8092,65 @@ export async function buildServer(config = loadConfig()) {
       const searchScope = beginSearchRequest(request, account.id);
 
       try {
-        const artistWindow = searchWindowSize(artistOffset, artistCount);
-        const albumWindow = searchWindowSize(albumOffset, albumCount);
-        const songWindow = searchWindowSize(songOffset, songCount);
+        const [artistSearch, albumSearch, trackSearch] = await Promise.all([
+          artistCount > 0
+            ? queryArtistsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: artistCount,
+              offset: artistOffset,
+            })
+            : { total: 0, items: [] },
+          albumCount > 0
+            ? queryAlbumsBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: albumCount,
+              offset: albumOffset,
+            })
+            : { total: 0, items: [] },
+          songCount > 0
+            ? queryTracksBySearch({
+              accountId: account.id,
+              plexState,
+              request,
+              query,
+              count: songCount,
+              offset: songOffset,
+            })
+            : { total: 0, items: [] },
+        ]);
 
-        const { artists, albums, tracks } = await runPlexSearch({
-          plexState,
-          query,
-          artistWindow,
-          albumWindow,
-          songWindow,
-          signal: searchScope.signal,
-        });
+        let matchedArtists = artistSearch.items;
+        const matchedAlbums = albumSearch.items;
+        const matchedTracks = trackSearch.items;
+        if (artistCount > 0 && matchedArtists.length === 0) {
+          const fallbackTracks = await queryTracksBySearch({
+            accountId: account.id,
+            plexState,
+            request,
+            query,
+            count: Math.min(500, Math.max(artistCount * 10, 100)),
+            offset: 0,
+          });
+          const virtualArtists = deriveVirtualArtistsFromTracks(fallbackTracks.items, query);
+          matchedArtists = takePage(virtualArtists, artistOffset, artistCount);
+        }
 
-        const matchedArtists = takePage(
-          artists.filter((artist) => includesText(artist.title, query)),
-          artistOffset,
-          artistCount,
-        );
-        const matchedAlbums = takePage(
-          albums.filter((album) => includesText(album.title, query) || includesText(album.parentTitle, query)),
-          albumOffset,
-          albumCount,
-        );
-        const matchedTracks = takePage(
-          tracks.filter((track) => includesText(track.title, query) || includesText(track.grandparentTitle, query)),
-          songOffset,
-          songCount,
-        );
+        reply.header('x-total-artists', String(artistSearch.total));
+        reply.header('x-total-albums', String(albumSearch.total));
+        reply.header('x-total-songs', String(trackSearch.total));
+        reply.header('x-total-count', String(trackSearch.total));
 
         const artistItems = matchedArtists
           .map((artist) => ({
             id: artist.ratingKey,
             name: artist.title,
-            coverArt: artist.ratingKey,
+            coverArt: firstNonEmptyText([artist?.thumb, artist?.ratingKey], undefined),
             ...subsonicRatingAttrs(artist),
           }));
         const albumItems = matchedAlbums
@@ -5701,7 +8160,7 @@ export async function buildServer(config = loadConfig()) {
             id: track.ratingKey,
             title: track.title,
             album: track.parentTitle,
-            artist: track.grandparentTitle,
+            artist: trackPrimaryArtistName(track) || track.grandparentTitle,
           }));
 
         const searchResult = {};
@@ -5999,13 +8458,10 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
-      const ids = uniqueNonEmptyValues([
-        ...getRequestParamValues(request, 'id'),
-        ...getRequestParamValues(request, 'albumId'),
-        ...getRequestParamValues(request, 'artistId'),
-      ]);
-
-      if (ids.length === 0) {
+      const genericIds = uniqueNonEmptyValues(getRequestParamValues(request, 'id'));
+      const albumIds = uniqueNonEmptyValues(getRequestParamValues(request, 'albumId'));
+      const artistIds = uniqueNonEmptyValues(getRequestParamValues(request, 'artistId'));
+      if (genericIds.length === 0 && albumIds.length === 0 && artistIds.length === 0) {
         return sendSubsonicError(reply, 10, 'Required parameter is missing');
       }
 
@@ -6015,10 +8471,52 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const [resolvedGenericIds, resolvedAlbumIds, resolvedArtistIds] = await Promise.all([
+        Promise.all(
+          genericIds.map((id) =>
+            resolveCachedLibraryRatingKeyAnyCollection({
+              accountId: account.id,
+              plexState,
+              request,
+              id,
+            }),
+          ),
+        ),
+        Promise.all(
+          albumIds.map((id) =>
+            resolveCachedLibraryRatingKey({
+              accountId: account.id,
+              plexState,
+              request,
+              collection: 'albums',
+              id,
+            }),
+          ),
+        ),
+        Promise.all(
+          artistIds.map((id) =>
+            resolveCachedLibraryRatingKey({
+              accountId: account.id,
+              plexState,
+              request,
+              collection: 'artists',
+              id,
+            }),
+          ),
+        ),
+      ]);
+      const ids = uniqueNonEmptyValues([
+        ...resolvedGenericIds,
+        ...resolvedAlbumIds,
+        ...resolvedArtistIds,
+      ]);
+      if (ids.length === 0) {
+        return sendSubsonicOk(reply);
+      }
+
       const cacheKey = searchBrowseCacheKey(account.id, plexState);
-      const cacheEntry = searchBrowseCache.get(cacheKey);
       const actions = ids.map((id) => {
-        const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+        const currentRating = getCachedUserRatingForItem(cacheKey, id);
         return {
           id,
           targetRating: toLikedPlexRating(currentRating),
@@ -6026,16 +8524,21 @@ export async function buildServer(config = loadConfig()) {
       });
 
       try {
-        await Promise.all(
+        const results = await Promise.allSettled(
           actions.map(({ id, targetRating }) =>
             ratePlexItem({
               baseUrl: plexState.baseUrl,
               plexToken: plexState.plexToken,
               itemId: id,
               rating: targetRating,
-            }),
-          ),
+            })),
         );
+        const failed = results.find(
+          (result) => result.status === 'rejected' && !isPlexNotFoundError(result.reason),
+        );
+        if (failed && failed.status === 'rejected') {
+          throw failed.reason;
+        }
       } catch (error) {
         request.log.error(error, 'Failed to star item(s) in Plex');
         return sendSubsonicError(reply, 10, 'Failed to star');
@@ -6066,13 +8569,10 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
-      const ids = uniqueNonEmptyValues([
-        ...getRequestParamValues(request, 'id'),
-        ...getRequestParamValues(request, 'albumId'),
-        ...getRequestParamValues(request, 'artistId'),
-      ]);
-
-      if (ids.length === 0) {
+      const genericIds = uniqueNonEmptyValues(getRequestParamValues(request, 'id'));
+      const albumIds = uniqueNonEmptyValues(getRequestParamValues(request, 'albumId'));
+      const artistIds = uniqueNonEmptyValues(getRequestParamValues(request, 'artistId'));
+      if (genericIds.length === 0 && albumIds.length === 0 && artistIds.length === 0) {
         return sendSubsonicError(reply, 10, 'Required parameter is missing');
       }
 
@@ -6082,10 +8582,52 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const [resolvedGenericIds, resolvedAlbumIds, resolvedArtistIds] = await Promise.all([
+        Promise.all(
+          genericIds.map((id) =>
+            resolveCachedLibraryRatingKeyAnyCollection({
+              accountId: account.id,
+              plexState,
+              request,
+              id,
+            }),
+          ),
+        ),
+        Promise.all(
+          albumIds.map((id) =>
+            resolveCachedLibraryRatingKey({
+              accountId: account.id,
+              plexState,
+              request,
+              collection: 'albums',
+              id,
+            }),
+          ),
+        ),
+        Promise.all(
+          artistIds.map((id) =>
+            resolveCachedLibraryRatingKey({
+              accountId: account.id,
+              plexState,
+              request,
+              collection: 'artists',
+              id,
+            }),
+          ),
+        ),
+      ]);
+      const ids = uniqueNonEmptyValues([
+        ...resolvedGenericIds,
+        ...resolvedAlbumIds,
+        ...resolvedArtistIds,
+      ]);
+      if (ids.length === 0) {
+        return sendSubsonicOk(reply);
+      }
+
       const cacheKey = searchBrowseCacheKey(account.id, plexState);
-      const cacheEntry = searchBrowseCache.get(cacheKey);
       const actions = ids.map((id) => {
-        const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+        const currentRating = getCachedUserRatingForItem(cacheKey, id);
         return {
           id,
           targetRating: toUnlikedPlexRating(currentRating),
@@ -6093,16 +8635,21 @@ export async function buildServer(config = loadConfig()) {
       });
 
       try {
-        await Promise.all(
+        const results = await Promise.allSettled(
           actions.map(({ id, targetRating }) =>
             ratePlexItem({
               baseUrl: plexState.baseUrl,
               plexToken: plexState.plexToken,
               itemId: id,
               rating: targetRating,
-            }),
-          ),
+            })),
         );
+        const failed = results.find(
+          (result) => result.status === 'rejected' && !isPlexNotFoundError(result.reason),
+        );
+        if (failed && failed.status === 'rejected') {
+          throw failed.reason;
+        }
       } catch (error) {
         request.log.error(error, 'Failed to unstar item(s) in Plex');
         return sendSubsonicError(reply, 10, 'Failed to unstar');
@@ -6151,26 +8698,38 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
+      const resolvedId = await resolveCachedLibraryRatingKeyAnyCollection({
+        accountId: account.id,
+        plexState,
+        request,
+        id,
+      });
+      if (!resolvedId) {
+        return sendSubsonicOk(reply);
+      }
+
       const cacheKey = searchBrowseCacheKey(account.id, plexState);
-      const cacheEntry = searchBrowseCache.get(cacheKey);
-      const currentRating = getCachedUserRatingForItem(cacheEntry, id);
+      const currentRating = getCachedUserRatingForItem(cacheKey, resolvedId);
       const preserveLike = rating >= 2 && isPlexLiked(currentRating);
       const plexRating = subsonicRatingToPlexRating(rating, { liked: preserveLike });
       try {
         await ratePlexItem({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          itemId: id,
+          itemId: resolvedId,
           rating: plexRating,
         });
       } catch (error) {
+        if (isPlexNotFoundError(error)) {
+          return sendSubsonicOk(reply);
+        }
         request.log.error(error, 'Failed to set rating in Plex');
         return sendSubsonicError(reply, 10, 'Failed to set rating');
       }
 
       const patchedCount = applyUserRatingPatchToSearchBrowseCache({
         cacheKey,
-        itemIds: [id],
+        itemIds: [resolvedId],
         userRating: plexRating,
       });
       if (patchedCount === 0) {
@@ -6614,13 +9173,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const artistId = getQueryString(request, 'id');
-    if (!artistId) {
+    const rawArtistId = String(getQueryString(request, 'id') || '').trim();
+    if (!rawArtistId) {
       return sendSubsonicError(reply, 70, 'Missing artist id');
-    }
-
-    if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, { artist: '' });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6630,6 +9185,13 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const artistId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'artists',
+        id: rawArtistId,
+      }) || rawArtistId;
       let artist = null;
       let finalAlbums = [];
 
@@ -6712,13 +9274,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const artistId = String(getRequestParam(request, 'id') || '').trim();
-    if (!artistId) {
+    const rawArtistId = String(getRequestParam(request, 'id') || '').trim();
+    if (!rawArtistId) {
       return sendSubsonicError(reply, 70, 'Missing artist id');
-    }
-
-    if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, { artistInfo: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6728,6 +9286,13 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const artistId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'artists',
+        id: rawArtistId,
+      }) || rawArtistId;
       let artist = null;
       try {
         artist = await getArtist({
@@ -6777,13 +9342,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const artistId = String(getRequestParam(request, 'id') || '').trim();
-    if (!artistId) {
+    const rawArtistId = String(getRequestParam(request, 'id') || '').trim();
+    if (!rawArtistId) {
       return sendSubsonicError(reply, 70, 'Missing artist id');
-    }
-
-    if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, { artistInfo2: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6793,6 +9354,13 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const artistId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'artists',
+        id: rawArtistId,
+      }) || rawArtistId;
       let artist = null;
       try {
         artist = await getArtist({
@@ -6842,13 +9410,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const albumId = getQueryString(request, 'id');
-    if (!albumId) {
+    const rawAlbumId = String(getQueryString(request, 'id') || '').trim();
+    if (!rawAlbumId) {
       return sendSubsonicError(reply, 70, 'Missing album id');
-    }
-
-    if (!isNumericRatingKey(albumId)) {
-      return sendSubsonicOk(reply, { album: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6858,21 +9422,40 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const album = await getAlbum({
+      const albumId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'albums',
+        id: rawAlbumId,
+      }) || rawAlbumId;
+      let album = await getAlbum({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
         albumId,
       });
+      let tracks = [];
 
-      if (!album) {
-        return sendSubsonicError(reply, 70, 'Album not found');
+      if (album) {
+        tracks = await listAlbumTracks({
+          baseUrl: plexState.baseUrl,
+          plexToken: plexState.plexToken,
+          albumId,
+        });
+      } else {
+        const fallback = await resolveAlbumFromCachedLibrary({
+          accountId: account.id,
+          plexState,
+          request,
+          albumId: rawAlbumId,
+        });
+        if (!fallback?.album) {
+          return sendSubsonicError(reply, 70, 'Album not found');
+        }
+        album = fallback.album;
+        tracks = Array.isArray(fallback.tracks) ? fallback.tracks : [];
       }
 
-      const tracks = await listAlbumTracks({
-        baseUrl: plexState.baseUrl,
-        plexToken: plexState.plexToken,
-        albumId,
-      });
       const tracksWithGenre = await hydrateTracksWithGenre({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
@@ -7009,12 +9592,27 @@ export async function buildServer(config = loadConfig()) {
         );
       }
 
+      const resolvedArtistDirectoryId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'artists',
+        id,
+      }) || id;
+      const resolvedAlbumDirectoryId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'albums',
+        id,
+      }) || id;
+
       let artist = null;
       try {
         artist = await getArtist({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          artistId: id,
+          artistId: resolvedArtistDirectoryId,
         });
       } catch (error) {
         if (!isPlexNotFoundError(error)) {
@@ -7027,7 +9625,7 @@ export async function buildServer(config = loadConfig()) {
         const albums = await listArtistAlbums({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          artistId: id,
+          artistId: resolvedArtistDirectoryId,
         });
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: albums });
 
@@ -7036,7 +9634,7 @@ export async function buildServer(config = loadConfig()) {
           const tracks = await listArtistTracks({
             baseUrl: plexState.baseUrl,
             plexToken: plexState.plexToken,
-            artistId: id,
+            artistId: resolvedArtistDirectoryId,
           });
           finalAlbums = deriveAlbumsFromTracks(tracks, artist.ratingKey, artist.title);
         }
@@ -7100,14 +9698,14 @@ export async function buildServer(config = loadConfig()) {
       const album = await getAlbum({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
-        albumId: id,
+        albumId: resolvedAlbumDirectoryId,
       });
 
       if (album) {
         const tracks = await listAlbumTracks({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          albumId: id,
+          albumId: resolvedAlbumDirectoryId,
         });
         const tracksWithGenre = await hydrateTracksWithGenre({
           baseUrl: plexState.baseUrl,
@@ -7184,21 +9782,24 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (musicFolderId && musicFolderId !== String(plexState.musicSectionId || '')) {
+      reply.header('x-total-count', '0');
       return sendSubsonicOk(reply, { [containerName]: [] });
     }
 
     try {
-      const allAlbums = await getCachedLibraryAlbums({ accountId: account.id, plexState, request });
-
-      const filtered = filterAndSortAlbumList(allAlbums, {
+      const { total, items } = await queryAlbumListFromCache({
+        accountId: account.id,
+        plexState,
+        request,
         type,
         fromYear,
         toYear,
         genre,
+        size,
+        offset,
       });
-      const page = sliceAlbumPage(filtered, offset, size);
-      reply.header('x-total-count', String(filtered.length));
-      const albumItems = page
+      reply.header('x-total-count', String(total));
+      const albumItems = items
         .map((album) =>
           albumJson(
             album,
@@ -7250,10 +9851,33 @@ export async function buildServer(config = loadConfig()) {
       let thumbPath = id.startsWith('/') ? id : null;
 
       if (!thumbPath) {
+        const [resolvedAlbumId, resolvedArtistId, resolvedTrackId] = await Promise.all([
+          resolveCachedLibraryRatingKey({
+            accountId: account.id,
+            plexState,
+            request,
+            collection: 'albums',
+            id,
+          }),
+          resolveCachedLibraryRatingKey({
+            accountId: account.id,
+            plexState,
+            request,
+            collection: 'artists',
+            id,
+          }),
+          resolveCachedLibraryRatingKey({
+            accountId: account.id,
+            plexState,
+            request,
+            collection: 'tracks',
+            id,
+          }),
+        ]);
         const metadata = await getAlbum({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          albumId: id,
+          albumId: resolvedAlbumId || id,
         });
 
         if (metadata) {
@@ -7264,7 +9888,7 @@ export async function buildServer(config = loadConfig()) {
           const artist = await getArtist({
             baseUrl: plexState.baseUrl,
             plexToken: plexState.plexToken,
-            artistId: id,
+            artistId: resolvedArtistId || id,
           });
 
           thumbPath = artist?.thumb || artist?.art || null;
@@ -7274,7 +9898,7 @@ export async function buildServer(config = loadConfig()) {
           const track = await getTrack({
             baseUrl: plexState.baseUrl,
             plexToken: plexState.plexToken,
-            trackId: id,
+            trackId: resolvedTrackId || id,
           });
 
           thumbPath = track?.thumb || track?.parentThumb || track?.grandparentThumb || null;
@@ -7315,8 +9939,8 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const trackId = getQueryString(request, 'id');
-    if (!trackId) {
+    const rawTrackId = String(getQueryString(request, 'id') || '').trim();
+    if (!rawTrackId) {
       return sendSubsonicError(reply, 70, 'Missing track id');
     }
 
@@ -7327,6 +9951,13 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const trackId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'tracks',
+        id: rawTrackId,
+      }) || rawTrackId;
       const track = await getTrack({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
@@ -7443,8 +10074,8 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const trackId = getQueryString(request, 'id');
-    if (!trackId) {
+    const rawTrackId = String(getQueryString(request, 'id') || '').trim();
+    if (!rawTrackId) {
       return sendSubsonicError(reply, 70, 'Missing track id');
     }
 
@@ -7455,6 +10086,13 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
+      const trackId = await resolveCachedLibraryRatingKey({
+        accountId: account.id,
+        plexState,
+        request,
+        collection: 'tracks',
+        id: rawTrackId,
+      }) || rawTrackId;
       const track = await getTrack({
         baseUrl: plexState.baseUrl,
         plexToken: plexState.plexToken,
@@ -7800,6 +10438,10 @@ export async function buildServer(config = loadConfig()) {
   app.get('/rest/*', async (request, reply) => {
     const endpointPath = String(request.url || '').split('?')[0] || '/rest/unknown';
     return sendSubsonicError(reply, 10, `Endpoint not implemented: ${endpointPath}`);
+  });
+
+  warmAllLinkedLibraryCaches('startup').catch((error) => {
+    app.log.warn(error, 'Startup library cache warm-up failed');
   });
 
   return app;

@@ -121,6 +121,215 @@ export function migrate(db) {
   }
 }
 
+export function migrateCache(db) {
+  const hasCacheAlbumTable = Boolean(
+    db.prepare(`
+      SELECT 1 AS exists_flag
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'plex_library_cache_albums'
+      LIMIT 1
+    `).get(),
+  );
+  if (hasCacheAlbumTable) {
+    const albumColumns = db.prepare(`PRAGMA table_info(plex_library_cache_albums)`).all();
+    const hasPlayCountColumn = albumColumns.some((column) => column.name === 'play_count');
+    if (!hasPlayCountColumn) {
+      db.exec(`
+        DROP TABLE IF EXISTS plex_library_cache_track_album_artists;
+        DROP TABLE IF EXISTS plex_library_cache_track_artists;
+        DROP TABLE IF EXISTS plex_library_cache_track_genres;
+        DROP TABLE IF EXISTS plex_library_cache_tracks;
+        DROP TABLE IF EXISTS plex_library_cache_album_genres;
+        DROP TABLE IF EXISTS plex_library_cache_albums;
+        DROP TABLE IF EXISTS plex_library_cache_artists;
+        DROP TABLE IF EXISTS plex_library_cache_state;
+      `);
+    }
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plex_library_cache_state (
+      cache_key TEXT PRIMARY KEY,
+      last_fingerprint TEXT NOT NULL DEFAULT '',
+      last_checked_at INTEGER NOT NULL DEFAULT 0,
+      last_synced_at INTEGER NOT NULL DEFAULT 0,
+      dirty INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_artists (
+      cache_key TEXT NOT NULL,
+      rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      sort_key TEXT NOT NULL DEFAULT '',
+      title TEXT,
+      title_sort TEXT,
+      summary TEXT,
+      thumb TEXT,
+      key_path TEXT,
+      guid TEXT,
+      source_uri TEXT,
+      added_at INTEGER,
+      updated_at INTEGER,
+      user_rating INTEGER,
+      child_count INTEGER,
+      leaf_count INTEGER,
+      album_count INTEGER,
+      type TEXT,
+      updated_cache_at INTEGER NOT NULL,
+      PRIMARY KEY (cache_key, rating_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_albums (
+      cache_key TEXT NOT NULL,
+      rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      sort_key TEXT NOT NULL DEFAULT '',
+      title TEXT,
+      title_sort TEXT,
+      original_title TEXT,
+      parent_rating_key TEXT,
+      parent_title TEXT,
+      thumb TEXT,
+      key_path TEXT,
+      guid TEXT,
+      source_uri TEXT,
+      added_at INTEGER,
+      updated_at INTEGER,
+      last_viewed_at INTEGER,
+      user_rating INTEGER,
+      play_count INTEGER,
+      child_count INTEGER,
+      leaf_count INTEGER,
+      duration INTEGER,
+      year INTEGER,
+      type TEXT,
+      updated_cache_at INTEGER NOT NULL,
+      PRIMARY KEY (cache_key, rating_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_album_genres (
+      cache_key TEXT NOT NULL,
+      album_rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      genre_name TEXT NOT NULL,
+      PRIMARY KEY (cache_key, album_rating_key, genre_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_tracks (
+      cache_key TEXT NOT NULL,
+      rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      sort_key TEXT NOT NULL DEFAULT '',
+      title TEXT,
+      title_sort TEXT,
+      original_title TEXT,
+      parent_rating_key TEXT,
+      parent_title TEXT,
+      grandparent_rating_key TEXT,
+      grandparent_title TEXT,
+      artist_id TEXT,
+      key_path TEXT,
+      guid TEXT,
+      source_uri TEXT,
+      thumb TEXT,
+      added_at INTEGER,
+      updated_at INTEGER,
+      last_viewed_at INTEGER,
+      user_rating INTEGER,
+      view_count INTEGER,
+      duration INTEGER,
+      track_index INTEGER,
+      parent_index INTEGER,
+      disc_number INTEGER,
+      parent_year INTEGER,
+      year INTEGER,
+      media_bitrate INTEGER,
+      media_container TEXT,
+      part_size INTEGER,
+      part_file TEXT,
+      audio_sampling_rate INTEGER,
+      audio_bit_depth INTEGER,
+      audio_stream_language TEXT,
+      composer TEXT,
+      country TEXT,
+      style TEXT,
+      mood TEXT,
+      record_label TEXT,
+      language TEXT,
+      album_type TEXT,
+      is_compilation INTEGER,
+      is_soundtrack INTEGER,
+      type TEXT,
+      updated_cache_at INTEGER NOT NULL,
+      PRIMARY KEY (cache_key, rating_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_track_genres (
+      cache_key TEXT NOT NULL,
+      track_rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      genre_name TEXT NOT NULL,
+      PRIMARY KEY (cache_key, track_rating_key, genre_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_track_artists (
+      cache_key TEXT NOT NULL,
+      track_rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      artist_id TEXT,
+      artist_name TEXT NOT NULL,
+      PRIMARY KEY (cache_key, track_rating_key, order_index)
+    );
+
+    CREATE TABLE IF NOT EXISTS plex_library_cache_track_album_artists (
+      cache_key TEXT NOT NULL,
+      track_rating_key TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      artist_id TEXT,
+      artist_name TEXT NOT NULL,
+      PRIMARY KEY (cache_key, track_rating_key, order_index)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cache_artists_order
+      ON plex_library_cache_artists(cache_key, order_index);
+    CREATE INDEX IF NOT EXISTS idx_cache_artists_title
+      ON plex_library_cache_artists(cache_key, sort_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_artists_rating
+      ON plex_library_cache_artists(cache_key, rating_key);
+
+    CREATE INDEX IF NOT EXISTS idx_cache_albums_order
+      ON plex_library_cache_albums(cache_key, order_index);
+    CREATE INDEX IF NOT EXISTS idx_cache_albums_title
+      ON plex_library_cache_albums(cache_key, sort_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_albums_parent
+      ON plex_library_cache_albums(cache_key, parent_rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_albums_rating
+      ON plex_library_cache_albums(cache_key, rating_key);
+
+    CREATE INDEX IF NOT EXISTS idx_cache_album_genres_name
+      ON plex_library_cache_album_genres(cache_key, genre_name);
+
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_order
+      ON plex_library_cache_tracks(cache_key, order_index);
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_title
+      ON plex_library_cache_tracks(cache_key, sort_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_parent
+      ON plex_library_cache_tracks(cache_key, parent_rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_grandparent
+      ON plex_library_cache_tracks(cache_key, grandparent_rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_rating
+      ON plex_library_cache_tracks(cache_key, rating_key);
+
+    CREATE INDEX IF NOT EXISTS idx_cache_track_genres_name
+      ON plex_library_cache_track_genres(cache_key, genre_name);
+    CREATE INDEX IF NOT EXISTS idx_cache_track_artists_artist
+      ON plex_library_cache_track_artists(cache_key, artist_id, artist_name);
+    CREATE INDEX IF NOT EXISTS idx_cache_track_album_artists_artist
+      ON plex_library_cache_track_album_artists(cache_key, artist_id, artist_name);
+  `);
+}
+
 export function createRepositories(db) {
   const createAccountStmt = db.prepare(`
     INSERT INTO accounts (id, username, password_hash, subsonic_password_enc, enabled, created_at)
@@ -265,6 +474,23 @@ export function createRepositories(db) {
     LEFT JOIN plex_selected_library psl ON psl.account_id = a.id
     WHERE a.id = ?
   `);
+  const listAccountPlexContextsStmt = db.prepare(`
+    SELECT
+      a.id AS account_id,
+      a.username AS username,
+      a.enabled AS enabled,
+      pl.plex_token_enc AS plex_token_enc,
+      pss.machine_id AS machine_id,
+      pss.name AS server_name,
+      pss.base_url AS server_base_url,
+      pss.server_token_enc AS server_token_enc,
+      psl.music_section_id AS music_section_id,
+      psl.music_section_name AS music_section_name
+    FROM accounts a
+    LEFT JOIN plex_links pl ON pl.account_id = a.id
+    LEFT JOIN plex_selected_server pss ON pss.account_id = a.id
+    LEFT JOIN plex_selected_library psl ON psl.account_id = a.id
+  `);
 
   const deletePlexLinkStmt = db.prepare(`
     DELETE FROM plex_links
@@ -407,6 +633,10 @@ export function createRepositories(db) {
 
     getAccountPlexContext(accountId) {
       return getAccountPlexContextStmt.get(accountId) || null;
+    },
+
+    listAccountPlexContexts() {
+      return listAccountPlexContextsStmt.all() || [];
     },
 
     unlinkPlex(accountId) {

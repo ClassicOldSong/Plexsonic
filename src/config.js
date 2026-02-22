@@ -77,12 +77,14 @@ export function loadConfig(env = process.env) {
   const bindHost = env.BIND_HOST || DEFAULT_HOST;
   const baseUrl = normalizeOptionalBaseUrl(env.BASE_URL);
   const sqlitePath = env.SQLITE_PATH || './data/app.db';
+  const cacheSqlitePath = env.CACHE_SQLITE_PATH || './data/cache.db';
 
   return {
     bindHost,
     baseUrl,
     port,
     sqlitePath,
+    cacheSqlitePath,
     sessionSecret: normalizeSessionSecret(env.SESSION_SECRET),
     tokenEncKey: env.TOKEN_ENC_KEY || null,
     plexInsecureTls: env.PLEX_INSECURE_TLS === '1',

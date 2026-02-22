@@ -73,7 +73,7 @@ import {
   updatePlexPlaybackStatus,
 } from './plex.js';
 import { createTokenCipher } from './token-crypto.js';
-import { emptyNode, failedResponse, failedResponseJson, node, okResponse, okResponseJson } from './subsonic-xml.js';
+import { failedResponse, failedResponseJson, okResponse, okResponseJson } from './subsonic-xml.js';
 
 const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,32}$/;
 const DEFAULT_CORS_ALLOW_HEADERS = [
@@ -196,9 +196,6 @@ function parsePlexWebhookPayload(body) {
   const parseMaybeJson = (value) => {
     if (!value || typeof value !== 'string') {
       return null;
-    }
-    if (!/^\d+$/.test(albumId)) {
-      return sendSubsonicOk(reply, node('album'));
     }
 
     try {
@@ -707,21 +704,22 @@ function groupArtistsForSubsonic(artists) {
   });
 
   return keys.map((key) => {
-    const artistNodes = groups
+    const artistItems = groups
       .get(key)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((artist) =>
-        emptyNode('artist', {
-          id: artist.id,
-          name: artist.name,
-          albumCount: artistAlbumCountValue(artist.artist),
-          coverArt: artist.id,
-          roles: ['artist'],
-          ...subsonicRatingAttrs(artist.artist),
-        }),
-      );
+      .map((artist) => ({
+        id: artist.id,
+        name: artist.name,
+        albumCount: artistAlbumCountValue(artist.artist),
+        coverArt: artist.id,
+        roles: ['artist'],
+        ...subsonicRatingAttrs(artist.artist),
+      }));
 
-    return node('index', { name: key }, artistNodes);
+    return {
+      name: key,
+      artist: artistItems,
+    };
   });
 }
 
@@ -759,15 +757,16 @@ function groupNamedEntriesForSubsonic(entries) {
     const items = groups
       .get(key)
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((item) =>
-        emptyNode('artist', {
-          id: item.id,
-          name: item.name,
-          coverArt: item.coverArt,
-        }),
-      );
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        coverArt: item.coverArt,
+      }));
 
-    return node('index', { name: key }, items);
+    return {
+      name: key,
+      artist: items,
+    };
   });
 }
 
@@ -858,7 +857,10 @@ function firstNonEmptyText(candidates, fallback = '') {
       return text;
     }
   }
-  return fallback;
+  if (arguments.length >= 2) {
+    return fallback;
+  }
+  return '';
 }
 
 function normalizePlexRating(value) {
@@ -1053,7 +1055,9 @@ function albumAttrs(album, fallbackArtistId = null, fallbackArtistName = null) {
     [album?.parentTitle, fallbackArtistName],
     'Unknown Artist',
   );
-  const genre = firstGenreTag(album) || undefined;
+  const albumGenreTags = allGenreTags(album);
+  const genre = albumGenreTags[0] || undefined;
+  const genres = genreObjects(albumGenreTags);
 
   return {
     id: albumId,
@@ -1063,6 +1067,7 @@ function albumAttrs(album, fallbackArtistId = null, fallbackArtistName = null) {
     name: title,
     album: title,
     artist: artistName,
+    displayArtist: artistName,
     artistId: album.parentRatingKey || fallbackArtistId || undefined,
     coverArt: albumId || undefined,
     songCount: album.leafCount || album.childCount || undefined,
@@ -1070,6 +1075,7 @@ function albumAttrs(album, fallbackArtistId = null, fallbackArtistName = null) {
     created: toIsoFromEpochSeconds(album.addedAt),
     year: album.year,
     genre,
+    genres,
     ...subsonicRatingAttrs(album),
   };
 }
@@ -1099,23 +1105,23 @@ function albumArtistEntries(album, fallbackArtistId = null, fallbackArtistName =
   return entry ? [entry] : [];
 }
 
-function renderArtistListNode(listName, entries, options = {}) {
+function renderArtistList(listName, entries) {
   if (!entries || entries.length === 0) {
     return null;
   }
-  const artistNodes = entries.map((entry) => emptyNode('artist', { id: entry.id, name: entry.name }));
-  const attrs = options.flatten ? { flatten: 'true' } : {};
-  return node(listName, attrs, artistNodes);
+  return entries.map((entry) => ({ id: entry.id, name: entry.name }));
 }
 
-function albumNode(name, album, attrs, fallbackArtistId = null, fallbackArtistName = null, extra = null) {
+function albumJson(album, attrs, fallbackArtistId = null, fallbackArtistName = null) {
   const artistEntries = albumArtistEntries(album, fallbackArtistId, fallbackArtistName);
-  const artistsNode = renderArtistListNode('artists', artistEntries, { flatten: true });
-  const inner = [artistsNode, extra].filter(Boolean);
-  if (inner.length === 0) {
-    return emptyNode(name, attrs);
+  const artists = renderArtistList('artists', artistEntries);
+  if (!artists || artists.length === 0) {
+    return attrs;
   }
-  return node(name, attrs, inner);
+  return {
+    ...attrs,
+    artists,
+  };
 }
 
 function artistAlbumCountValue(artist) {
@@ -1141,13 +1147,16 @@ function albumId3Attrs(album, fallbackArtistId = null, fallbackArtistName = null
   );
   const songCount = parseNonNegativeInt(album?.leafCount ?? album?.childCount, 0);
   const playCount = albumPlayCountValue(album);
-  const genre = firstGenreTag(album) || undefined;
+  const albumGenreTags = allGenreTags(album);
+  const genre = albumGenreTags[0] || undefined;
+  const genres = genreObjects(albumGenreTags);
   const played = toIsoFromEpochSeconds(album?.lastViewedAt);
 
   return {
     id: albumId,
     name,
     artist: artistName,
+    displayArtist: artistName,
     artistId: album.parentRatingKey || fallbackArtistId || undefined,
     coverArt: albumId || undefined,
     songCount: songCount || undefined,
@@ -1157,6 +1166,7 @@ function albumId3Attrs(album, fallbackArtistId = null, fallbackArtistName = null
     created: toIsoFromEpochSeconds(album.addedAt),
     year: album.year,
     genre,
+    genres,
     ...subsonicRatingAttrs(album),
   };
 }
@@ -1214,6 +1224,15 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     [track?.originalTitle, track?.grandparentTitle],
     'Unknown Artist',
   );
+  const displayAlbumArtist = firstNonEmptyText(
+    [albumMetadata?.artist, albumMetadata?.parentTitle, track?.artist, track?.grandparentTitle],
+    normalizedArtist,
+  );
+  const composer = metadataFieldText(
+    [track, albumMetadata],
+    ['Composer', 'composer', 'Composers', 'composers', 'Writer', 'writer'],
+  );
+  const displayComposer = firstNonEmptyText([composer], '');
   const coverArt = firstNonEmptyText(
     [albumCoverArt, track?.parentRatingKey, track?.ratingKey],
     undefined,
@@ -1222,7 +1241,7 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
   const genreTagsRaw = allGenreTags(track);
   const genreTags = genreTagsRaw.length > 0 ? genreTagsRaw : albumGenreTags;
   const genre = genreTags[0] || undefined;
-  const genres = genreTags.length > 0 ? genreTags.join('; ') : undefined;
+  const genres = genreObjects(genreTags);
   const styleValues = metadataFieldValues([track, albumMetadata], ['Style', 'style']);
   const style = styleValues[0] || undefined;
   const styles = styleValues.length > 0 ? styleValues.join('; ') : undefined;
@@ -1288,6 +1307,9 @@ function songAttrs(track, albumTitle = null, albumCoverArt = null, albumMetadata
     album: normalizedAlbumTitle,
     albumId,
     artist: normalizedArtist,
+    displayArtist: normalizedArtist,
+    displayAlbumArtist,
+    displayComposer,
     artistId: track.grandparentRatingKey || undefined,
     type: 'music',
     duration: durationSeconds(track.duration),
@@ -1350,29 +1372,32 @@ function trackAlbumArtistEntries(track, albumMetadata = null) {
 }
 
 function buildSongArtistChildren(track, albumMetadata = null) {
-  const artistsNode = renderArtistListNode('artists', trackArtistEntries(track), { flatten: true });
-  const albumArtistsNode = renderArtistListNode('albumArtists', trackAlbumArtistEntries(track, albumMetadata), {
-    flatten: true,
-  });
-  return [artistsNode, albumArtistsNode].filter(Boolean);
+  const artists = renderArtistList('artists', trackArtistEntries(track));
+  const albumArtists = renderArtistList('albumArtists', trackAlbumArtistEntries(track, albumMetadata));
+  const out = {};
+  if (artists && artists.length > 0) {
+    out.artists = artists;
+  }
+  if (albumArtists && albumArtists.length > 0) {
+    out.albumArtists = albumArtists;
+  }
+  return out;
 }
 
-function songNode(track, albumTitle = null, albumCoverArt = null, albumMetadata = null) {
+function songJson(track, albumTitle = null, albumCoverArt = null, albumMetadata = null) {
   const attrs = songAttrs(track, albumTitle, albumCoverArt, albumMetadata);
-  const inner = buildSongArtistChildren(track, albumMetadata);
-  if (inner.length === 0) {
-    return emptyNode('song', attrs);
-  }
-  return node('song', attrs, inner);
+  return {
+    ...attrs,
+    ...buildSongArtistChildren(track, albumMetadata),
+  };
 }
 
-function songChildNode(track, albumTitle = null, albumCoverArt = null, albumMetadata = null, extraAttrs = {}) {
+function songChildJson(track, albumTitle = null, albumCoverArt = null, albumMetadata = null, extraAttrs = {}) {
   const attrs = { ...songAttrs(track, albumTitle, albumCoverArt, albumMetadata), ...extraAttrs };
-  const inner = buildSongArtistChildren(track, albumMetadata);
-  if (inner.length === 0) {
-    return emptyNode('child', attrs);
-  }
-  return node('child', attrs, inner);
+  return {
+    ...attrs,
+    ...buildSongArtistChildren(track, albumMetadata),
+  };
 }
 
 function sortTracksByDiscAndIndex(tracks) {
@@ -2098,6 +2123,12 @@ function takePage(items, offset, size) {
   return items.slice(offset, offset + size);
 }
 
+function assignNonEmptyBucket(target, key, items) {
+  if (Array.isArray(items) && items.length > 0) {
+    target[key] = items;
+  }
+}
+
 function shuffleInPlace(items) {
   for (let i = items.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -2327,6 +2358,18 @@ function allGenreTags(item) {
   }
 
   return [...new Set(tags)];
+}
+
+function genreObjects(tags) {
+  const normalized = [...new Set(
+    (Array.isArray(tags) ? tags : [])
+      .map((tag) => String(tag || '').trim())
+      .filter(Boolean),
+  )];
+  if (normalized.length === 0) {
+    return undefined;
+  }
+  return normalized.map((name) => ({ name }));
 }
 
 function buildAlbumGenreTagMap(albums) {
@@ -4457,14 +4500,14 @@ export async function buildServer(config = loadConfig()) {
   app.get('/rest/getOpenSubsonicExtensions.view', async (_request, reply) => {
     return sendSubsonicOk(
       reply,
-      node(
-        'openSubsonicExtensions',
-        {},
-        emptyNode('openSubsonicExtension', {
+      {
+        openSubsonicExtensions: [
+          {
           name: 'songLyrics',
           versions: [1],
-        }),
-      ),
+          },
+        ],
+      },
     );
   });
 
@@ -4480,7 +4523,7 @@ export async function buildServer(config = loadConfig()) {
 
     return sendSubsonicOk(
       reply,
-      emptyNode('license', attrs),
+      { license: attrs },
     );
   });
 
@@ -4490,7 +4533,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, emptyNode('ping'));
+    return sendSubsonicOk(reply, { ping: {} });
   });
 
   app.get('/rest/getMusicFolders.view', async (request, reply) => {
@@ -4512,11 +4555,11 @@ export async function buildServer(config = loadConfig()) {
       String(plexState.serverName || '').trim() ||
       'Music';
 
-    const inner = node(
-      'musicFolders',
-      {},
-      emptyNode('musicFolder', { id: musicFolderId, name: musicFolderName }),
-    );
+    const inner = {
+      musicFolders: [
+        { id: musicFolderId, name: musicFolderName },
+      ],
+    };
     return sendSubsonicOk(reply, inner);
   });
 
@@ -4528,7 +4571,7 @@ export async function buildServer(config = loadConfig()) {
 
     return sendSubsonicOk(
       reply,
-      emptyNode('user', {
+      { user: {
         username: account.username,
         email: config.licenseEmail || undefined,
         scrobblingEnabled: true,
@@ -4544,7 +4587,7 @@ export async function buildServer(config = loadConfig()) {
         jukeboxRole: false,
         shareRole: false,
         videoConversionRole: false,
-      }),
+      } },
     );
   });
 
@@ -4571,7 +4614,7 @@ export async function buildServer(config = loadConfig()) {
         .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
 
       if (sessions.length === 0) {
-        return sendSubsonicOk(reply, node('nowPlaying'));
+        return sendSubsonicOk(reply, { nowPlaying: [] });
       }
 
       const dedupedByItemId = new Map();
@@ -4601,15 +4644,15 @@ export async function buildServer(config = loadConfig()) {
             0,
             Math.floor((Date.now() - Number(session?.updatedAt || Date.now())) / 60000),
           );
-          return emptyNode('entry', {
+          return {
             ...songAttrs(track),
             username: account.username,
             playerId: session?.clientIdentifier || undefined,
             minutesAgo,
-          });
+          };
         });
 
-      return sendSubsonicOk(reply, node('nowPlaying', {}, entries));
+      return sendSubsonicOk(reply, { nowPlaying: entries });
     } catch (error) {
       request.log.error(error, 'Failed to load now playing entries');
       return sendSubsonicError(reply, 10, 'Failed to load now playing');
@@ -4632,7 +4675,7 @@ export async function buildServer(config = loadConfig()) {
       const section = await getMusicSectionScanStatus(plexState);
       return sendSubsonicOk(
         reply,
-        emptyNode('scanStatus', scanStatusAttrsFromSection(section)),
+        { scanStatus: scanStatusAttrsFromSection(section) },
       );
     } catch (error) {
       request.log.error(error, 'Failed to load scan status from Plex');
@@ -4665,7 +4708,7 @@ export async function buildServer(config = loadConfig()) {
       const section = await getMusicSectionScanStatus(plexState);
       return sendSubsonicOk(
         reply,
-        emptyNode('scanStatus', scanStatusAttrsFromSection(section, { fallbackScanning: true })),
+        { scanStatus: scanStatusAttrsFromSection(section, { fallbackScanning: true }) },
       );
     } catch (error) {
       request.log.error(error, 'Failed to trigger Plex scan');
@@ -4694,24 +4737,28 @@ export async function buildServer(config = loadConfig()) {
 
       const starredArtists = artists
         .filter((artist) => isPlexLiked(artist.userRating))
-        .map((artist) =>
-          emptyNode('artist', {
-            id: artist.ratingKey,
-            name: artist.title,
-            coverArt: artist.ratingKey,
-            ...subsonicRatingAttrs(artist),
-          }),
-        );
+        .map((artist) => ({
+          id: artist.ratingKey,
+          name: artist.title,
+          coverArt: artist.ratingKey,
+          ...subsonicRatingAttrs(artist),
+        }));
 
       const starredAlbums = albums
         .filter((album) => isPlexLiked(album.userRating))
-        .map((album) => albumNode('album', album, albumAttrs(album)));
+        .map((album) => albumJson(album, albumAttrs(album)));
 
       const starredSongs = tracks
         .filter((track) => isPlexLiked(track.userRating))
-        .map((track) => songNode(track));
+        .map((track) => songJson(track));
 
-      return sendSubsonicOk(reply, node('starred', {}, [...starredArtists, ...starredAlbums, ...starredSongs]));
+      return sendSubsonicOk(reply, {
+        starred: {
+          artist: starredArtists,
+          album: starredAlbums,
+          song: starredSongs,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load starred items');
       return sendSubsonicError(reply, 10, 'Failed to load starred items');
@@ -4739,25 +4786,29 @@ export async function buildServer(config = loadConfig()) {
 
       const starredArtists = artists
         .filter((artist) => isPlexLiked(artist.userRating))
-        .map((artist) =>
-          emptyNode('artist', {
-            id: artist.ratingKey,
-            name: artist.title,
-            albumCount: artistAlbumCountValue(artist),
-            coverArt: artist.ratingKey,
-            ...subsonicRatingAttrs(artist),
-          }),
-        );
+        .map((artist) => ({
+          id: artist.ratingKey,
+          name: artist.title,
+          albumCount: artistAlbumCountValue(artist),
+          coverArt: artist.ratingKey,
+          ...subsonicRatingAttrs(artist),
+        }));
 
       const starredAlbums = albums
         .filter((album) => isPlexLiked(album.userRating))
-        .map((album) => albumNode('album', album, albumId3Attrs(album)));
+        .map((album) => albumJson(album, albumId3Attrs(album)));
 
       const starredSongs = tracks
         .filter((track) => isPlexLiked(track.userRating))
-        .map((track) => songNode(track));
+        .map((track) => songJson(track));
 
-      return sendSubsonicOk(reply, node('starred2', {}, [...starredArtists, ...starredAlbums, ...starredSongs]));
+      return sendSubsonicOk(reply, {
+        starred2: {
+          artist: starredArtists,
+          album: starredAlbums,
+          song: starredSongs,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load starred items');
       return sendSubsonicError(reply, 10, 'Failed to load starred items');
@@ -4808,20 +4859,15 @@ export async function buildServer(config = loadConfig()) {
           }
         }
 
-        const genreNodes = [...counts.values()]
+        const genreItems = [...counts.values()]
           .sort((a, b) => a.name.localeCompare(b.name))
-          .map((genre) =>
-            node(
-              'genre',
-              {
-                songCount: genre.songCount,
-                albumCount: genre.albumIds.size,
-              },
-              genre.name,
-            ),
-          );
+          .map((genre) => ({
+            songCount: genre.songCount,
+            albumCount: genre.albumIds.size,
+            value: genre.name,
+          }));
 
-        return sendSubsonicOk(reply, node('genres', {}, genreNodes));
+        return sendSubsonicOk(reply, { genres: genreItems });
       } catch (error) {
         request.log.error(error, 'Failed to load genres');
         return sendSubsonicError(reply, 10, 'Failed to load genres');
@@ -4869,8 +4915,8 @@ export async function buildServer(config = loadConfig()) {
         const sortedSongs = sortTracksForLibraryBrowse(matchedSongs);
         const page = takePage(sortedSongs, offset, count)
           .map((track) => withResolvedTrackGenres(track, albumGenreTagMap));
-        const songs = page.map((track) => songNode(track));
-        return sendSubsonicOk(reply, node('songsByGenre', {}, songs));
+        const songs = page.map((track) => songJson(track));
+        return sendSubsonicOk(reply, { songsByGenre: songs });
       } catch (error) {
         request.log.error(error, 'Failed to load songs by genre');
         return sendSubsonicError(reply, 10, 'Failed to load songs by genre');
@@ -4896,8 +4942,8 @@ export async function buildServer(config = loadConfig()) {
       const allTracks = await getCachedLibraryTracks({ accountId: account.id, plexState, request });
 
       const randomTracks = shuffleInPlace(allTracks.slice()).slice(0, size);
-      const songs = randomTracks.map((track) => songNode(track));
-      return sendSubsonicOk(reply, node('randomSongs', {}, songs));
+      const songs = randomTracks.map((track) => songJson(track));
+      return sendSubsonicOk(reply, { randomSongs: songs });
     } catch (error) {
       request.log.error(error, 'Failed to load random songs');
       return sendSubsonicError(reply, 10, 'Failed to load random songs');
@@ -4929,7 +4975,7 @@ export async function buildServer(config = loadConfig()) {
         artists.find((item) => safeLower(item.title) === safeLower(artistName)) ||
         artists.find((item) => includesText(item.title, artistName));
       if (!artist) {
-        return sendSubsonicOk(reply, node('topSongs'));
+        return sendSubsonicOk(reply, { topSongs: [] });
       }
 
       const tracks = await listArtistTracks({
@@ -4940,8 +4986,8 @@ export async function buildServer(config = loadConfig()) {
       applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
       const topTracks = tracks.slice(0, size);
-      const songs = topTracks.map((track) => songNode(track));
-      return sendSubsonicOk(reply, node('topSongs', {}, songs));
+      const songs = topTracks.map((track) => songJson(track));
+      return sendSubsonicOk(reply, { topSongs: songs });
     } catch (error) {
       request.log.error(error, 'Failed to load top songs');
       return sendSubsonicError(reply, 10, 'Failed to load top songs');
@@ -5061,8 +5107,8 @@ export async function buildServer(config = loadConfig()) {
         }
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
-        const songs = tracks.map((track) => songNode(track));
-        return sendSubsonicOk(reply, node('similarSongs', {}, songs));
+        const songs = tracks.map((track) => songJson(track));
+        return sendSubsonicOk(reply, { similarSongs: songs });
       } catch (error) {
         request.log.error(error, 'Failed to load similar songs');
         return sendSubsonicError(reply, 10, 'Failed to load similar songs');
@@ -5105,8 +5151,8 @@ export async function buildServer(config = loadConfig()) {
         }
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
-        const songs = tracks.map((track) => songNode(track));
-        return sendSubsonicOk(reply, node('similarSongs2', {}, songs));
+        const songs = tracks.map((track) => songJson(track));
+        return sendSubsonicOk(reply, { similarSongs2: songs });
       } catch (error) {
         request.log.error(error, 'Failed to load similar songs2');
         return sendSubsonicError(reply, 10, 'Failed to load similar songs');
@@ -5161,7 +5207,7 @@ export async function buildServer(config = loadConfig()) {
       }
       applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: [track] });
 
-      return sendSubsonicOk(reply, node('song', songAttrs(track)));
+      return sendSubsonicOk(reply, { song: songAttrs(track) });
     } catch (error) {
       request.log.error(error, 'Failed to load song');
       return sendSubsonicError(reply, 10, 'Failed to load song');
@@ -5181,7 +5227,7 @@ export async function buildServer(config = loadConfig()) {
       const titleQuery = String(getRequestParam(request, 'title') || '').trim();
       const query = `${artistQuery} ${titleQuery}`.trim();
       if (!query) {
-        return sendSubsonicOk(reply, emptyNode('lyrics'));
+        return sendSubsonicOk(reply, { lyrics: {} });
       }
 
       const context = repo.getAccountPlexContext(account.id);
@@ -5214,11 +5260,11 @@ export async function buildServer(config = loadConfig()) {
         if (!matchedTrack) {
           return sendSubsonicOk(
             reply,
-            emptyNode('lyrics', {
+            { lyrics: {
               artist: artistQuery || undefined,
               title: titleQuery || undefined,
               value: '',
-            }),
+            } },
           );
         }
 
@@ -5259,11 +5305,11 @@ export async function buildServer(config = loadConfig()) {
 
         return sendSubsonicOk(
           reply,
-          emptyNode('lyrics', {
+          { lyrics: {
             artist: finalArtist,
             title: finalTitle,
             value: plainLyrics.value,
-          }),
+          } },
         );
       } catch (error) {
         if (isAbortError(error)) {
@@ -5327,33 +5373,20 @@ export async function buildServer(config = loadConfig()) {
         });
 
         const structuredLyrics = extractStructuredLyricsFromTrack(track, lyricCandidates);
-        const structuredLyricsNodes = structuredLyrics
-          .map((lyrics) => {
-            const lineNodes = lyrics.lines
-              .map((line) =>
-                node(
-                  'line',
-                  {
-                    start: line.start,
-                  },
-                  line.value,
-                ),
-              );
+        const structuredLyricsItems = structuredLyrics
+          .map((lyrics) => ({
+            displayArtist: lyrics.displayArtist,
+            displayTitle: lyrics.displayTitle,
+            lang: lyrics.lang,
+            synced: lyrics.synced,
+            offset: lyrics.offset,
+            line: lyrics.lines.map((line) => ({
+              start: line.start,
+              value: line.value,
+            })),
+          }));
 
-            return node(
-              'structuredLyrics',
-              {
-                displayArtist: lyrics.displayArtist,
-                displayTitle: lyrics.displayTitle,
-                lang: lyrics.lang,
-                synced: lyrics.synced,
-                offset: lyrics.offset,
-              },
-              lineNodes,
-            );
-          });
-
-        return sendSubsonicOk(reply, node('lyricsList', {}, structuredLyricsNodes));
+        return sendSubsonicOk(reply, { lyricsList: structuredLyricsItems });
       } catch (error) {
         if (isAbortError(error)) {
           const reason = String(lyricsScope.reason() || '');
@@ -5399,8 +5432,14 @@ export async function buildServer(config = loadConfig()) {
         return;
       }
 
-      if (musicFolderId && musicFolderId !== String(plexState.musicSectionId || '')) {
-        return sendSubsonicOk(reply, node('searchResult3'));
+      const hasValidMusicFolder =
+        !musicFolderId ||
+        musicFolderId === String(plexState.musicSectionId || '');
+      if (!hasValidMusicFolder) {
+        request.log.debug(
+          { musicFolderId, expected: String(plexState.musicSectionId || '') },
+          'Ignoring non-matching musicFolderId in search3',
+        );
       }
 
       const searchScope = beginSearchRequest(request, account.id);
@@ -5440,39 +5479,39 @@ export async function buildServer(config = loadConfig()) {
             signal: searchScope.signal,
           });
 
-          matchedArtists = takePage(
-            artists.filter((artist) => includesText(artist.title, query)),
-            artistOffset,
-            artistCount,
-          );
-          matchedAlbums = takePage(
-            albums.filter((album) => includesText(album.title, query) || includesText(album.parentTitle, query)),
-            albumOffset,
-            albumCount,
-          );
-          matchedTracks = takePage(
-            tracks.filter((track) => includesText(track.title, query) || includesText(track.grandparentTitle, query)),
-            songOffset,
-            songCount,
-          );
+          const filteredArtists = artists.filter((artist) => includesText(artist.title, query));
+          const filteredAlbums = albums.filter((album) => includesText(album.title, query) || includesText(album.parentTitle, query));
+          const filteredTracks = tracks.filter((track) => includesText(track.title, query) || includesText(track.grandparentTitle, query));
+
+          // Plex search can return fuzzy-ranked items where title match is not strict.
+          // If strict filtering erases everything, fall back to Plex-ranked results.
+          const artistSource = (filteredArtists.length > 0 || artists.length === 0) ? filteredArtists : artists;
+          const albumSource = (filteredAlbums.length > 0 || albums.length === 0) ? filteredAlbums : albums;
+          const trackSource = (filteredTracks.length > 0 || tracks.length === 0) ? filteredTracks : tracks;
+
+          matchedArtists = takePage(artistSource, artistOffset, artistCount);
+          matchedAlbums = takePage(albumSource, albumOffset, albumCount);
+          matchedTracks = takePage(trackSource, songOffset, songCount);
         }
 
-        const artistNodes = matchedArtists
-          .map((artist) =>
-            emptyNode('artist', {
-              id: artist.ratingKey,
-              name: artist.title,
-              albumCount: artistAlbumCountValue(artist),
-              coverArt: artist.ratingKey,
-              ...subsonicRatingAttrs(artist),
-            }),
-          );
-        const albumNodes = matchedAlbums
-          .map((album) => albumNode('album', album, albumId3Attrs(album)));
-        const songNodes = matchedTracks
-          .map((track) => songNode(track));
+        const artistItems = matchedArtists
+          .map((artist) => ({
+            id: artist.ratingKey,
+            name: artist.title,
+            albumCount: artistAlbumCountValue(artist),
+            coverArt: artist.ratingKey,
+            ...subsonicRatingAttrs(artist),
+          }));
+        const albumItems = matchedAlbums
+          .map((album) => albumJson(album, albumId3Attrs(album)));
+        const songItems = matchedTracks
+          .map((track) => songJson(track));
 
-        return sendSubsonicOk(reply, node('searchResult3', {}, [...artistNodes, ...albumNodes, ...songNodes]));
+        const searchResult3 = {};
+        assignNonEmptyBucket(searchResult3, 'artist', artistItems);
+        assignNonEmptyBucket(searchResult3, 'album', albumItems);
+        assignNonEmptyBucket(searchResult3, 'song', songItems);
+        return sendSubsonicOk(reply, { searchResult3 });
       } catch (error) {
         if (isAbortError(error)) {
           const reason = String(searchScope.reason() || '');
@@ -5512,7 +5551,7 @@ export async function buildServer(config = loadConfig()) {
       const songOffset = parseNonNegativeInt(getRequestParam(request, 'songOffset'), 0);
 
       if (!query) {
-        return sendSubsonicOk(reply, node('searchResult2'));
+        return sendSubsonicOk(reply, { searchResult2: {} });
       }
 
       const context = repo.getAccountPlexContext(account.id);
@@ -5552,21 +5591,23 @@ export async function buildServer(config = loadConfig()) {
           songCount,
         );
 
-        const artistNodes = matchedArtists
-          .map((artist) =>
-            emptyNode('artist', {
-              id: artist.ratingKey,
-              name: artist.title,
-              coverArt: artist.ratingKey,
-              ...subsonicRatingAttrs(artist),
-            }),
-          );
-        const albumNodes = matchedAlbums
-          .map((album) => albumNode('album', album, albumAttrs(album)));
-        const songNodes = matchedTracks
-          .map((track) => songNode(track));
+        const artistItems = matchedArtists
+          .map((artist) => ({
+            id: artist.ratingKey,
+            name: artist.title,
+            coverArt: artist.ratingKey,
+            ...subsonicRatingAttrs(artist),
+          }));
+        const albumItems = matchedAlbums
+          .map((album) => albumJson(album, albumAttrs(album)));
+        const songItems = matchedTracks
+          .map((track) => songJson(track));
 
-        return sendSubsonicOk(reply, node('searchResult2', {}, [...artistNodes, ...albumNodes, ...songNodes]));
+        const searchResult2 = {};
+        assignNonEmptyBucket(searchResult2, 'artist', artistItems);
+        assignNonEmptyBucket(searchResult2, 'album', albumItems);
+        assignNonEmptyBucket(searchResult2, 'song', songItems);
+        return sendSubsonicOk(reply, { searchResult2 });
       } catch (error) {
         if (isAbortError(error)) {
           const reason = String(searchScope.reason() || '');
@@ -5606,7 +5647,7 @@ export async function buildServer(config = loadConfig()) {
       const songOffset = parseNonNegativeInt(getRequestParam(request, 'songOffset'), 0);
 
       if (!query) {
-        return sendSubsonicOk(reply, node('searchResult'));
+        return sendSubsonicOk(reply, { searchResult: {} });
       }
 
       const context = repo.getAccountPlexContext(account.id);
@@ -5646,28 +5687,28 @@ export async function buildServer(config = loadConfig()) {
           songCount,
         );
 
-        const artistNodes = matchedArtists
-          .map((artist) =>
-            emptyNode('artist', {
-              id: artist.ratingKey,
-              name: artist.title,
-              coverArt: artist.ratingKey,
-              ...subsonicRatingAttrs(artist),
-            }),
-          );
-        const albumNodes = matchedAlbums
-          .map((album) => albumNode('album', album, albumAttrs(album)));
-        const matchNodes = matchedTracks
-          .map((track) =>
-            emptyNode('match', {
-              id: track.ratingKey,
-              title: track.title,
-              album: track.parentTitle,
-              artist: track.grandparentTitle,
-            }),
-          );
+        const artistItems = matchedArtists
+          .map((artist) => ({
+            id: artist.ratingKey,
+            name: artist.title,
+            coverArt: artist.ratingKey,
+            ...subsonicRatingAttrs(artist),
+          }));
+        const albumItems = matchedAlbums
+          .map((album) => albumJson(album, albumAttrs(album)));
+        const matchItems = matchedTracks
+          .map((track) => ({
+            id: track.ratingKey,
+            title: track.title,
+            album: track.parentTitle,
+            artist: track.grandparentTitle,
+          }));
 
-        return sendSubsonicOk(reply, node('searchResult', {}, [...artistNodes, ...albumNodes, ...matchNodes]));
+        const searchResult = {};
+        assignNonEmptyBucket(searchResult, 'artist', artistItems);
+        assignNonEmptyBucket(searchResult, 'album', albumItems);
+        assignNonEmptyBucket(searchResult, 'match', matchItems);
+        return sendSubsonicOk(reply, { searchResult });
       } catch (error) {
         if (isAbortError(error)) {
           const reason = String(searchScope.reason() || '');
@@ -5695,7 +5736,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, node('bookmarks'));
+    return sendSubsonicOk(reply, { bookmarks: {} });
   });
 
   app.get('/rest/getInternetRadioStations.view', async (request, reply) => {
@@ -5704,7 +5745,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    return sendSubsonicOk(reply, node('internetRadioStations'));
+    return sendSubsonicOk(reply, { internetRadioStations: {} });
   });
 
   app.get('/rest/getPlayQueue.view', async (request, reply) => {
@@ -5740,21 +5781,20 @@ export async function buildServer(config = loadConfig()) {
       });
 
       const entries = tracks
-        .map((track) => emptyNode('entry', songAttrs(track)));
+        .map((track) => songAttrs(track));
       const changedIso = new Date(Number(queueState.updatedAt || Date.now())).toISOString();
 
       return sendSubsonicOk(
         reply,
-        node(
-          'playQueue',
-          {
+        {
+          playQueue: {
             current: queueState.current || '',
             position: parseNonNegativeInt(queueState.position, 0),
             username: account.username,
             changed: changedIso,
+            entry: entries,
           },
-          entries,
-        ),
+        },
       );
     } catch (error) {
       request.log.error(error, 'Failed to load saved play queue');
@@ -6232,9 +6272,8 @@ export async function buildServer(config = loadConfig()) {
 
       return sendSubsonicOk(
         reply,
-        node(
-          'playlist',
-          {
+        {
+          playlist: {
             id: effectiveId,
             name: effectiveName,
             owner: account.username,
@@ -6245,8 +6284,7 @@ export async function buildServer(config = loadConfig()) {
             created: nowIso,
             changed: nowIso,
           },
-          '',
-        ),
+        },
       );
     },
   });
@@ -6279,10 +6317,10 @@ export async function buildServer(config = loadConfig()) {
       });
 
       const nowIso = new Date().toISOString();
-      const playlistNodes = playlists
-        .map((playlist) => emptyNode('playlist', playlistAttrs(playlist, account.username, nowIso)));
+      const playlistItems = playlists
+        .map((playlist) => playlistAttrs(playlist, account.username, nowIso));
 
-      return sendSubsonicOk(reply, node('playlists', {}, playlistNodes));
+      return sendSubsonicOk(reply, { playlists: playlistItems });
     } catch (error) {
       request.log.error(error, 'Failed to load playlists');
       return sendSubsonicError(reply, 10, 'Failed to load playlists');
@@ -6326,12 +6364,14 @@ export async function buildServer(config = loadConfig()) {
 
       const nowIso = new Date().toISOString();
       const entries = tracks
-        .map((track) => {
-          const attrs = songAttrs(track, track.parentTitle || undefined, track.parentRatingKey || undefined);
-          return emptyNode('entry', attrs);
-        });
+        .map((track) => songAttrs(track, track.parentTitle || undefined, track.parentRatingKey || undefined));
 
-      return sendSubsonicOk(reply, node('playlist', playlistAttrs(playlist, account.username, nowIso), entries));
+      return sendSubsonicOk(reply, {
+        playlist: {
+          ...playlistAttrs(playlist, account.username, nowIso),
+          entry: entries,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load playlist');
       return sendSubsonicError(reply, 10, 'Failed to load playlist');
@@ -6503,7 +6543,12 @@ export async function buildServer(config = loadConfig()) {
       const artists = await getCachedLibraryArtists({ accountId: account.id, plexState, request });
 
       const indexes = groupArtistsForSubsonic(artists);
-      return sendSubsonicOk(reply, node('artists', { ignoredArticles: 'The El La Los Las Le Les' }, indexes));
+      return sendSubsonicOk(reply, {
+        artists: {
+          ignoredArticles: 'The El La Los Las Le Les',
+          index: indexes,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load artists from Plex');
       return sendSubsonicError(reply, 10, 'Failed to load artists');
@@ -6549,14 +6594,13 @@ export async function buildServer(config = loadConfig()) {
       const indexes = groupNamedEntriesForSubsonic(folderEntries);
       return sendSubsonicOk(
         reply,
-        node(
-          'indexes',
-          {
+        {
+          indexes: {
             ignoredArticles: 'The El La Los Las Le Les',
             lastModified: 0,
+            index: indexes,
           },
-          indexes,
-        ),
+        },
       );
     } catch (error) {
       request.log.error(error, 'Failed to load indexes from Plex');
@@ -6576,7 +6620,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, node('artist', {}, ''));
+      return sendSubsonicOk(reply, { artist: '' });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6633,10 +6677,9 @@ export async function buildServer(config = loadConfig()) {
         finalAlbums = fallback.albums || [];
       }
 
-      const albumXml = finalAlbums
+      const albumItems = finalAlbums
         .map((album) =>
-          albumNode(
-            'album',
+          albumJson(
             album,
             albumId3Attrs(album, artist.ratingKey, artist.title),
             artist.ratingKey,
@@ -6646,17 +6689,16 @@ export async function buildServer(config = loadConfig()) {
 
       return sendSubsonicOk(
         reply,
-        node(
-          'artist',
-          {
+        {
+          artist: {
             id: artist.ratingKey,
             name: artist.title,
             albumCount: finalAlbums.length,
             coverArt: artist.ratingKey,
             ...subsonicRatingAttrs(artist),
+            album: albumItems,
           },
-          albumXml,
-        ),
+        },
       );
     } catch (error) {
       request.log.error(error, 'Failed to load artist details from Plex');
@@ -6676,7 +6718,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, node('artistInfo'));
+      return sendSubsonicOk(reply, { artistInfo: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6717,12 +6759,12 @@ export async function buildServer(config = loadConfig()) {
 
       const biography = artistBioFromPlex(artist);
       const musicBrainzId = extractMusicBrainzArtistId(artist);
-      const children = [
-        biography ? node('biography', {}, biography) : null,
-        musicBrainzId ? node('musicBrainzId', {}, musicBrainzId) : null,
-      ].filter(Boolean);
-
-      return sendSubsonicOk(reply, node('artistInfo', {}, children));
+      return sendSubsonicOk(reply, {
+        artistInfo: {
+          biography: biography || undefined,
+          musicBrainzId: musicBrainzId || undefined,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load artist info');
       return sendSubsonicError(reply, 10, 'Failed to load artist info');
@@ -6741,7 +6783,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (!isNumericRatingKey(artistId)) {
-      return sendSubsonicOk(reply, node('artistInfo2'));
+      return sendSubsonicOk(reply, { artistInfo2: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6782,12 +6824,12 @@ export async function buildServer(config = loadConfig()) {
 
       const biography = artistBioFromPlex(artist);
       const musicBrainzId = extractMusicBrainzArtistId(artist);
-      const children = [
-        biography ? node('biography', {}, biography) : null,
-        musicBrainzId ? node('musicBrainzId', {}, musicBrainzId) : null,
-      ].filter(Boolean);
-
-      return sendSubsonicOk(reply, node('artistInfo2', {}, children));
+      return sendSubsonicOk(reply, {
+        artistInfo2: {
+          biography: biography || undefined,
+          musicBrainzId: musicBrainzId || undefined,
+        },
+      });
     } catch (error) {
       request.log.error(error, 'Failed to load artist info2');
       return sendSubsonicError(reply, 10, 'Failed to load artist info');
@@ -6806,7 +6848,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (!isNumericRatingKey(albumId)) {
-      return sendSubsonicOk(reply, node('album'));
+      return sendSubsonicOk(reply, { album: {} });
     }
 
     const context = repo.getAccountPlexContext(account.id);
@@ -6842,23 +6884,26 @@ export async function buildServer(config = loadConfig()) {
 
       const totalDuration = sortedTracks.reduce((sum, track) => sum + durationSeconds(track.duration), 0);
 
-      const songNodes = sortedTracks
-        .map((track) => songNode(track, album.title, album.ratingKey, album));
+      const songItems = sortedTracks
+        .map((track) => songJson(track, album.title, album.ratingKey, album));
 
       return sendSubsonicOk(
         reply,
-        albumNode(
-          'album',
-          album,
-          {
-            ...albumId3Attrs(album, album.parentRatingKey || null, album.parentTitle || null),
-            songCount: sortedTracks.length,
-            duration: totalDuration,
+        {
+          album: {
+            ...albumJson(
+              album,
+              {
+                ...albumId3Attrs(album, album.parentRatingKey || null, album.parentTitle || null),
+                songCount: sortedTracks.length,
+                duration: totalDuration,
+              },
+              album.parentRatingKey || null,
+              album.parentTitle || null,
+            ),
+            song: songItems,
           },
-          album.parentRatingKey || null,
-          album.parentTitle || null,
-          songNodes,
-        ),
+        },
       );
     } catch (error) {
       request.log.error(error, 'Failed to load album from Plex');
@@ -6906,7 +6951,7 @@ export async function buildServer(config = loadConfig()) {
         const children = folderResult.items
           .map((item) => {
             if (isLikelyPlexTrack(item)) {
-              return songChildNode(
+              return songChildJson(
                 item,
                 item.parentTitle || null,
                 item.parentRatingKey || null,
@@ -6919,7 +6964,7 @@ export async function buildServer(config = loadConfig()) {
             }
 
             if (isLikelyPlexAlbum(item)) {
-              return albumNode('child', item, {
+              return albumJson(item, {
                 ...albumAttrs(item),
                 isDir: true,
                 parent: currentDirectoryId,
@@ -6936,13 +6981,13 @@ export async function buildServer(config = loadConfig()) {
 
             const title = String(item?.title || item?.name || 'Folder');
             const folderId = encodePlexFolderId(folderKey, plexState.musicSectionId) || folderKey;
-            return emptyNode('child', {
+            return {
               id: folderId,
               parent: currentDirectoryId,
               isDir: true,
               title,
               name: title,
-            });
+            };
           })
           .filter(Boolean);
 
@@ -6953,15 +6998,14 @@ export async function buildServer(config = loadConfig()) {
 
         return sendSubsonicOk(
           reply,
-          node(
-            'directory',
-            {
+          {
+            directory: {
               id: currentDirectoryId,
               parent: isRootFolder ? undefined : rootDirectoryId,
               name: directoryName,
+              child: children,
             },
-            children,
-          ),
+          },
         );
       }
 
@@ -6999,8 +7043,7 @@ export async function buildServer(config = loadConfig()) {
 
         const children = finalAlbums
           .map((album) =>
-            albumNode(
-              'child',
+            albumJson(
               album,
               albumAttrs(album, artist.ratingKey, artist.title),
               artist.ratingKey,
@@ -7010,15 +7053,14 @@ export async function buildServer(config = loadConfig()) {
 
         return sendSubsonicOk(
           reply,
-          node(
-            'directory',
-            {
+          {
+            directory: {
               id: artist.ratingKey,
               parent: rootDirectoryId,
               name: artist.title,
+              child: children,
             },
-            children,
-          ),
+          },
         );
       }
 
@@ -7033,8 +7075,7 @@ export async function buildServer(config = loadConfig()) {
           const fallbackAlbums = fallback.albums || [];
           const children = fallbackAlbums
             .map((album) =>
-              albumNode(
-                'child',
+              albumJson(
                 album,
                 albumAttrs(album, fallback.artist.ratingKey, fallback.artist.title),
                 fallback.artist.ratingKey,
@@ -7044,15 +7085,14 @@ export async function buildServer(config = loadConfig()) {
 
           return sendSubsonicOk(
             reply,
-            node(
-              'directory',
-              {
+            {
+              directory: {
                 id: fallback.artist.ratingKey,
                 parent: rootDirectoryId,
                 name: fallback.artist.title,
+                child: children,
               },
-              children,
-            ),
+            },
           );
         }
       }
@@ -7080,7 +7120,7 @@ export async function buildServer(config = loadConfig()) {
 
         const children = sortedTracks
           .map((track) =>
-            songChildNode(track, album.title, album.ratingKey, album, {
+            songChildJson(track, album.title, album.ratingKey, album, {
               isDir: false,
               parent: album.ratingKey,
             }),
@@ -7088,15 +7128,14 @@ export async function buildServer(config = loadConfig()) {
 
         return sendSubsonicOk(
           reply,
-          node(
-            'directory',
-            {
+          {
+            directory: {
               id: album.ratingKey,
               parent: album.parentRatingKey || rootDirectoryId,
               name: album.title,
+              child: children,
             },
-            children,
-          ),
+          },
         );
       }
 
@@ -7145,7 +7184,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (musicFolderId && musicFolderId !== String(plexState.musicSectionId || '')) {
-      return sendSubsonicOk(reply, node(containerName));
+      return sendSubsonicOk(reply, { [containerName]: [] });
     }
 
     try {
@@ -7159,16 +7198,15 @@ export async function buildServer(config = loadConfig()) {
       });
       const page = sliceAlbumPage(filtered, offset, size);
       reply.header('x-total-count', String(filtered.length));
-      const albumNodes = page
+      const albumItems = page
         .map((album) =>
-          albumNode(
-            'album',
+          albumJson(
             album,
             containerName === 'albumList2' ? albumId3Attrs(album) : albumAttrs(album),
           ),
         );
 
-      return sendSubsonicOk(reply, node(containerName, {}, albumNodes));
+      return sendSubsonicOk(reply, { [containerName]: albumItems });
     } catch (error) {
       request.log.error(error, 'Failed to load album list');
       return sendSubsonicError(reply, 10, 'Failed to load album list');

@@ -21,134 +21,25 @@
 import { APP_VERSION } from './version.js';
 
 const XML_HEADER = '<?xml version="1.0" encoding="UTF-8"?>';
+const ROOT_NAME = 'subsonic-response';
 const XMLNS = 'http://subsonic.org/restapi';
 const API_VERSION = '1.16.1';
 const SERVER_TYPE = 'Plexsonic';
 const SERVER_VERSION = APP_VERSION;
 const OPEN_SUBSONIC = true;
 
-
-
-export function xmlEscape(value) {
-  const sanitized = sanitizeXmlText(String(value));
-  return sanitized
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
-}
-
-function sanitizeXmlText(value) {
-  let output = '';
-  for (const char of value) {
-    const codePoint = char.codePointAt(0);
-    if (
-      codePoint === 0x9 ||
-      codePoint === 0xa ||
-      codePoint === 0xd ||
-      (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
-      (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
-      (codePoint >= 0x10000 && codePoint <= 0x10ffff)
-    ) {
-      output += char;
-    }
-  }
-  return output;
-}
-
-function normalizeChildren(input) {
-  if (input == null || input === '') {
-    return [];
-  }
-  if (Array.isArray(input)) {
-    return input.flatMap((item) => normalizeChildren(item));
-  }
-  if (typeof input === 'object' && input.kind === 'node') {
-    return [input];
-  }
-  if (typeof input === 'string') {
-    return [input];
-  }
-  return [String(input)];
-}
-
-function xmlAttrs(attrs = {}) {
-  return Object.entries(attrs)
-    .filter(([, value]) => value !== undefined && value !== null)
-    .map(([key, value]) => ` ${key}="${xmlEscape(value)}"`)
-    .join('');
-}
-
-function renderXmlPart(part) {
-  if (typeof part === 'string') {
-    return xmlEscape(part);
-  }
-  if (!part || part.kind !== 'node') {
-    return '';
-  }
-
-  const attrs = xmlAttrs(part.attrs);
-  if (part.selfClosing && part.children.length === 0) {
-    return `<${part.name}${attrs}/>`;
-  }
-
-  const inner = part.children.map(renderXmlPart).join('');
-  return `<${part.name}${attrs}>${inner}</${part.name}>`;
-}
-
-
-
-const NUMERIC_ATTRS = new Set([
-  'code',
-  'count',
-  'offset',
-  'duration',
-  'songCount',
-  'albumCount',
-  'track',
-  'discNumber',
-  'bitRate',
-  'size',
-  'year',
-  'userRating',
-  'playCount',
-  'leafCount',
-  'leafCountAdded',
-  'leafCountRequested',
-  'position',
-  'lastModified',
-  'start',
-  'sampleRate',
-  'bitDepth',
-]);
-
-const BOOLEAN_ATTRS = new Set([
+const ROOT_ATTR_KEYS = new Set([
+  'status',
+  'version',
+  'type',
+  'serverVersion',
   'openSubsonic',
-  'valid',
-  'scanning',
-  'isDir',
-  'public',
-  'scrobblingEnabled',
-  'adminRole',
-  'settingsRole',
-  'downloadRole',
-  'uploadRole',
-  'playlistRole',
-  'coverArtRole',
-  'commentRole',
-  'podcastRole',
-  'streamRole',
-  'jukeboxRole',
-  'shareRole',
-  'videoConversionRole',
-  'smart',
-  'synced',
-  'readonly',
-  'compilation',
-  'soundtrack',
+  'xmlns',
 ]);
 
+const XML_ATTR_LIST_KEYS = new Set(['genres', 'moods', 'styles', 'recordLabels']);
+
+// Dedicated XML schema rules: these define repeated child elements by parent element.
 const ARRAY_CHILDREN_BY_PARENT = {
   openSubsonicExtensions: new Set(['openSubsonicExtension']),
   albumList: new Set(['album']),
@@ -178,198 +69,287 @@ const ARRAY_CHILDREN_BY_PARENT = {
   starred2: new Set(['artist', 'album', 'song']),
 };
 
+// Dedicated scalar-child rules for XML where values should be child elements, not attributes.
+const SCALAR_CHILDREN_BY_PARENT = {
+  artistInfo: new Set(['biography', 'musicBrainzId']),
+  artistInfo2: new Set(['biography', 'musicBrainzId']),
+};
+
+function sanitizeXmlText(value) {
+  let output = '';
+  for (const char of value) {
+    const codePoint = char.codePointAt(0);
+    if (
+      codePoint === 0x9 ||
+      codePoint === 0xa ||
+      codePoint === 0xd ||
+      (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+      (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+      (codePoint >= 0x10000 && codePoint <= 0x10ffff)
+    ) {
+      output += char;
+    }
+  }
+  return output;
+}
+
+export function xmlEscape(value) {
+  const sanitized = sanitizeXmlText(String(value));
+  return sanitized
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
+function splitList(rawValue) {
+  if (Array.isArray(rawValue)) {
+    return rawValue.map((entry) => String(entry || '').trim()).filter(Boolean);
+  }
+
+  const raw = String(rawValue || '').trim();
+  if (!raw) {
+    return [];
+  }
+
+  const parts = raw.includes(';') ? raw.split(';') : raw.split(',');
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+function toXmlAttrValue(key, value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  if (key === 'genres' || key === 'recordLabels') {
+    const names = Array.isArray(value)
+      ? value
+        .map((entry) => {
+          if (entry && typeof entry === 'object') {
+            return String(entry.name || '').trim();
+          }
+          return String(entry || '').trim();
+        })
+        .filter(Boolean)
+      : splitList(value);
+    return names.join('; ');
+  }
+
+  if (key === 'moods' || key === 'styles') {
+    return splitList(value).join('; ');
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => String(entry)).join(',');
+  }
+
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+
+  return String(value);
+}
+
+function xmlAttrs(attrs = {}) {
+  return Object.entries(attrs)
+    .map(([key, value]) => {
+      const attrValue = toXmlAttrValue(key, value);
+      if (attrValue == null) {
+        return '';
+      }
+      return ` ${key}="${xmlEscape(attrValue)}"`;
+    })
+    .join('');
+}
+
 function shouldUseArray(parentName, childName) {
   return ARRAY_CHILDREN_BY_PARENT[parentName]?.has(childName) || false;
 }
 
-function coerceAttrValue(key, value) {
-  const splitList = (rawValue) => {
-    if (Array.isArray(rawValue)) {
-      return rawValue.map((entry) => String(entry || '').trim()).filter(Boolean);
-    }
-    const raw = String(rawValue || '').trim();
-    if (!raw) {
-      return [];
-    }
-    const parts = raw.includes(';') ? raw.split(';') : raw.split(',');
-    return parts.map((part) => part.trim()).filter(Boolean);
-  };
-
-  if (key === 'genres') {
-    const genreNames = splitList(value);
-    return genreNames.map((name) => ({ name }));
-  }
-
-  if (key === 'moods') {
-    return splitList(value);
-  }
-
-  if (key === 'styles') {
-    return splitList(value);
-  }
-
-  if (key === 'recordLabels') {
-    const labels = splitList(value);
-    return labels.map((name) => ({ name }));
-  }
-
-  if (BOOLEAN_ATTRS.has(key)) {
-    if (value === 'true') {
-      return true;
-    }
-    if (value === 'false') {
-      return false;
-    }
-  }
-
-  if (NUMERIC_ATTRS.has(key) && /^-?\d+$/.test(String(value))) {
-    return Number(value);
-  }
-
-  return value;
+function isScalarChild(parentName, childName) {
+  return SCALAR_CHILDREN_BY_PARENT[parentName]?.has(childName) || false;
 }
 
-function nodeToJson(node) {
+function defaultArrayChildName(parentName) {
+  const children = ARRAY_CHILDREN_BY_PARENT[parentName];
+  if (!children || children.size !== 1) {
+    return null;
+  }
+  return [...children][0];
+}
+
+function isFlattenArtistList(name, value) {
+  if ((name !== 'artists' && name !== 'albumArtists') || !Array.isArray(value)) {
+    return false;
+  }
+  if (value.length === 0) {
+    return true;
+  }
+  return value.every((entry) => entry && typeof entry === 'object' && !Array.isArray(entry));
+}
+
+function shouldRenderAsChild(parentName, key, value) {
+  if (parentName === ROOT_NAME) {
+    return !ROOT_ATTR_KEYS.has(key);
+  }
+
+  if (key === 'value') {
+    return false;
+  }
+
+  if (isScalarChild(parentName, key)) {
+    return true;
+  }
+
+  if (shouldUseArray(parentName, key)) {
+    return true;
+  }
+
+  if (XML_ATTR_LIST_KEYS.has(key)) {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some((entry) => entry && typeof entry === 'object');
+  }
+
+  return Boolean(value && typeof value === 'object');
+}
+
+function renderXmlElement(name, value) {
+  if (value === undefined || value === null) {
+    return `<${name}/>`;
+  }
+
+  if (typeof value !== 'object') {
+    return `<${name}>${xmlEscape(value)}</${name}>`;
+  }
+
+  if (Array.isArray(value)) {
+    const childName =
+      (name === 'artists' || name === 'albumArtists')
+        ? 'artist'
+        : defaultArrayChildName(name);
+    const attrs = isFlattenArtistList(name, value) ? { flatten: 'true' } : {};
+
+    if (!childName) {
+      const text = value.map((entry) => String(entry)).join(', ');
+      return `<${name}${xmlAttrs(attrs)}>${xmlEscape(text)}</${name}>`;
+    }
+
+    const inner = value.map((entry) => renderXmlElement(childName, entry)).join('');
+    if (!inner) {
+      return `<${name}${xmlAttrs(attrs)}/>`;
+    }
+
+    return `<${name}${xmlAttrs(attrs)}>${inner}</${name}>`;
+  }
+
+  const attrs = {};
+  let textValue = '';
+  const childParts = [];
+
+  for (const [key, childValue] of Object.entries(value)) {
+    if (key === 'value') {
+      textValue += String(childValue || '');
+      continue;
+    }
+
+    if (!shouldRenderAsChild(name, key, childValue)) {
+      attrs[key] = childValue;
+      continue;
+    }
+
+    if (Array.isArray(childValue)) {
+      if (shouldUseArray(name, key)) {
+        for (const entry of childValue) {
+          childParts.push(renderXmlElement(key, entry));
+        }
+      } else {
+        childParts.push(renderXmlElement(key, childValue));
+      }
+      continue;
+    }
+
+    childParts.push(renderXmlElement(key, childValue));
+  }
+
+  const inner = `${xmlEscape(textValue)}${childParts.join('')}`;
+  if (!inner) {
+    return `<${name}${xmlAttrs(attrs)}/>`;
+  }
+
+  return `<${name}${xmlAttrs(attrs)}>${inner}</${name}>`;
+}
+
+function normalizeInner(inner) {
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) {
+    return {};
+  }
   const out = {};
-  for (const [key, value] of Object.entries(node.attrs || {})) {
-    out[key] = coerceAttrValue(key, value);
-  }
-
-  for (const child of node.children || []) {
-    if (typeof child === 'string') {
-      if (child.trim()) {
-        out.value = (out.value || '') + child;
+  for (const [key, value] of Object.entries(inner)) {
+    if (Array.isArray(value)) {
+      const childName = defaultArrayChildName(key);
+      if (childName && key !== 'artists' && key !== 'albumArtists') {
+        out[key] = { [childName]: value };
+      } else {
+        out[key] = value;
       }
       continue;
     }
-
-    const value = nodeToJson(child);
-    if (shouldUseArray(node.name, child.name)) {
-      if (!Array.isArray(out[child.name])) {
-        out[child.name] = [];
-      }
-      out[child.name].push(value);
-      continue;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(out, child.name)) {
-      if (!Array.isArray(out[child.name])) {
-        out[child.name] = [out[child.name]];
-      }
-      out[child.name].push(value);
-      continue;
-    }
-
-    out[child.name] = value;
+    out[key] = value;
   }
-
-  const keys = Object.keys(out);
-  if (keys.length === 1 && keys[0] === 'value') {
-    return out.value;
-  }
-
-  if (node.name === 'artists' || node.name === 'albumArtists') {
-    if (node.attrs?.flatten === 'true') {
-      const artistValue = out.artist;
-      if (Array.isArray(artistValue)) {
-        return artistValue;
-      }
-      if (artistValue != null) {
-        return [artistValue];
-      }
-      return [];
-    }
-  }
-
-  if (node.name === 'openSubsonicExtensions') {
-    const extensions = out.openSubsonicExtension;
-    if (Array.isArray(extensions)) {
-      return extensions;
-    }
-    return extensions == null ? [] : [extensions];
-  }
-
   return out;
 }
 
-function subsonicRoot(status, children = []) {
+function buildRoot(status, inner = {}) {
   return {
-    kind: 'node',
-    name: 'subsonic-response',
-    selfClosing: false,
-    attrs: {
-      status,
-      version: API_VERSION,
-      type: SERVER_TYPE,
-      serverVersion: SERVER_VERSION,
-      openSubsonic: OPEN_SUBSONIC,
-      xmlns: XMLNS,
-    },
-    children,
+    status,
+    version: API_VERSION,
+    type: SERVER_TYPE,
+    serverVersion: SERVER_VERSION,
+    openSubsonic: OPEN_SUBSONIC,
+    ...normalizeInner(inner),
   };
 }
 
-export function emptyNode(name, attrs = {}) {
+export function okResponseJson(inner = {}) {
   return {
-    kind: 'node',
-    name,
-    attrs,
-    children: [],
-    selfClosing: true,
+    [ROOT_NAME]: buildRoot('ok', inner),
   };
-}
-
-export function node(name, attrs = {}, inner = null) {
-  return {
-    kind: 'node',
-    name,
-    attrs,
-    children: normalizeChildren(inner),
-    selfClosing: false,
-  };
-}
-
-export function okResponse(inner = '') {
-  const root = subsonicRoot('ok', normalizeChildren(inner));
-  return `${XML_HEADER}${renderXmlPart(root)}`;
-}
-
-export function failedResponse(code, message) {
-  const errorNode = {
-    kind: 'node',
-    name: 'error',
-    attrs: {
-      code,
-      message: String(message),
-    },
-    children: [],
-    selfClosing: true,
-  };
-  const root = subsonicRoot('failed', [errorNode]);
-  return `${XML_HEADER}${renderXmlPart(root)}`;
-}
-
-export function okResponseJson(inner = '') {
-  const root = subsonicRoot('ok', normalizeChildren(inner));
-  const json = nodeToJson(root);
-  delete json.xmlns;
-  return { 'subsonic-response': json };
 }
 
 export function failedResponseJson(code, message) {
-  const errorNode = {
-    kind: 'node',
-    name: 'error',
-    attrs: {
-      code,
-      message: String(message),
-    },
-    children: [],
-    selfClosing: true,
+  return {
+    [ROOT_NAME]: buildRoot('failed', {
+      error: {
+        code,
+        message: String(message),
+      },
+    }),
   };
-  const root = subsonicRoot('failed', [errorNode]);
-  const json = nodeToJson(root);
-  delete json.xmlns;
-  return { 'subsonic-response': json };
 }
 
+export function subsonicJsonToXml(payload) {
+  const rootValue = payload?.[ROOT_NAME];
+  const safeRoot = rootValue && typeof rootValue === 'object' && !Array.isArray(rootValue)
+    ? rootValue
+    : buildRoot('failed', {
+      error: {
+        code: 0,
+        message: 'Invalid Subsonic payload',
+      },
+    });
+
+  const xmlRoot = safeRoot.xmlns ? safeRoot : { ...safeRoot, xmlns: XMLNS };
+  return `${XML_HEADER}${renderXmlElement(ROOT_NAME, xmlRoot)}`;
+}
+
+export function okResponse(inner = {}) {
+  return subsonicJsonToXml(okResponseJson(inner));
+}
+
+export function failedResponse(code, message) {
+  return subsonicJsonToXml(failedResponseJson(code, message));
+}

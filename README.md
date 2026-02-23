@@ -10,6 +10,12 @@ It provides:
 - Web test page for manual API checks
 - Playback/scrobble/rating/playlist actions mapped to Plex
 
+## Local Cache
+
+Plexsonic keeps a local SQLite cache of Plex music metadata to make browse/search responses fast and reduce repeated Plex API calls.
+The cache is stored separately from account/session data (`CACHE_SQLITE_PATH`, default `./data/cache.db`), refreshes automatically when Plex changes are detected, and can be safely rebuilt if removed.
+Cache entries are scoped by Plex account + Plex server/library, so local Plexsonic users linked to the same Plex account can share cached metadata.
+
 To support this project, please subscribe to my [Patreon](https://www.patreon.com/ClassicOldSong).
 
 [![Support me on Patreon](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Fshieldsio-patreon.vercel.app%2Fapi%3Fusername%3DClassicOldsong%26type%3Dpatrons&style=for-the-badge)](https://patreon.com/ClassicOldsong)

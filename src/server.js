@@ -1665,14 +1665,31 @@ function extractStructuredLyricsFromTrack(track, extraCandidates = []) {
     }
 
     const normalizedLang = firstNonEmptyText([lang], 'und');
-    const normalizedSynced = synced || lines.some((line) => Number.isFinite(line.start));
+    const normalizedLines = lines
+      .map((line) => ({
+        value: String(line?.value || ''),
+        start: Number.isFinite(line?.start) ? Math.trunc(line.start) : undefined,
+      }))
+      .filter((line) => Boolean(line.value));
+    if (normalizedLines.length === 0) {
+      return;
+    }
+
+    const normalizedSynced = synced || normalizedLines.some((line) => Number.isFinite(line.start));
+    const effectiveLines = normalizedSynced
+      ? normalizedLines.filter((line) => Number.isFinite(line.start) && line.start >= 0)
+      : normalizedLines;
+    if (effectiveLines.length === 0) {
+      return;
+    }
+
     const signature = JSON.stringify({
       lang: normalizedLang,
       synced: normalizedSynced,
       offset: Number.isFinite(offset) ? Math.trunc(offset) : null,
-      lines: lines.map((line) => ({
-        value: String(line.value || ''),
-        start: Number.isFinite(line.start) ? Math.trunc(line.start) : null,
+      lines: effectiveLines.map((line) => ({
+        value: line.value,
+        start: Number.isFinite(line.start) ? line.start : null,
       })),
     });
     if (seen.has(signature)) {
@@ -1686,12 +1703,12 @@ function extractStructuredLyricsFromTrack(track, extraCandidates = []) {
       lang: normalizedLang,
       synced: normalizedSynced,
       offset: Number.isFinite(offset) ? Math.trunc(offset) : undefined,
-      lines: lines.map((line) => {
-        const start = Number.isFinite(line.start) ? Math.trunc(line.start) : undefined;
+      lines: effectiveLines.map((line) => {
+        const start = Number.isFinite(line.start) ? line.start : undefined;
         if (start === undefined) {
-          return { value: String(line.value || '') };
+          return { value: line.value };
         }
-        return { value: String(line.value || ''), start };
+        return { value: line.value, start };
       }),
     });
   };
@@ -2526,12 +2543,19 @@ function filterAndSortAlbumList(albums, { type, fromYear, toYear, genre }) {
 
 function allGenreTags(item) {
   const tags = [];
+  const splitGenreParts = (value) =>
+    String(value || '')
+      .split(/[;,]/)
+      .map((part) => part.trim())
+      .filter(Boolean);
   const pushTag = (value) => {
     const text = String(value || '').trim();
     if (!text) {
       return;
     }
-    tags.push(text);
+    for (const part of splitGenreParts(text)) {
+      tags.push(part);
+    }
   };
 
   const genreEntries = Array.isArray(item?.Genre) ? item.Genre : [];
@@ -2552,14 +2576,7 @@ function allGenreTags(item) {
       pushTag(entry);
     }
   } else if (plainGenre != null) {
-    const raw = String(plainGenre);
-    if (raw.includes(';')) {
-      for (const part of raw.split(';')) {
-        pushTag(part);
-      }
-    } else {
-      pushTag(raw);
-    }
+    pushTag(plainGenre);
   }
 
   return [...new Set(tags)];
@@ -3919,8 +3936,42 @@ export async function buildServer(config = loadConfig()) {
     });
   });
 
+  function resolvePlexAccountCacheScope(accountId, plexState) {
+    const normalizedAccountId = String(accountId || '').trim();
+    let accountToken = '';
+
+    if (normalizedAccountId) {
+      const context = repo.getAccountPlexContext(normalizedAccountId);
+      if (context?.plex_token_enc) {
+        try {
+          accountToken = String(decodePlexTokenOrThrow(tokenCipher, context.plex_token_enc) || '').trim();
+        } catch { }
+      }
+    }
+
+    if (!accountToken) {
+      const tokenCandidates = Array.isArray(plexState?.plexToken)
+        ? plexState.plexToken
+        : [];
+      accountToken = String(
+        tokenCandidates[tokenCandidates.length - 1] ||
+        tokenCandidates[0] ||
+        '',
+      ).trim();
+    }
+
+    if (accountToken) {
+      return `plex-${md5HexUtf8(accountToken)}`;
+    }
+    if (normalizedAccountId) {
+      return `local-${normalizedAccountId}`;
+    }
+    return 'local-unknown';
+  }
+
   function searchBrowseCacheKey(accountId, plexState) {
-    return `${accountId}:${plexState.machineId}:${plexState.musicSectionId}`;
+    const accountScope = resolvePlexAccountCacheScope(accountId, plexState);
+    return `${accountScope}:${plexState.machineId}:${plexState.musicSectionId}`;
   }
 
   function emptyLibraryCacheState() {

@@ -38,9 +38,10 @@ There is no `plex_library_cache_items` JSON blob table anymore.
 ## 3. Cache Key
 
 Cache key format:
-- `${accountId}:${machineId}:${musicSectionId}`
+- `${plexAccountScope}:${machineId}:${musicSectionId}`
 
-This key isolates cache data per account + Plex server + selected music section.
+`plexAccountScope` is derived from the linked Plex account token (hashed), not the local Plexsonic account ID.
+This lets multiple local Plexsonic accounts linked to the same Plex account share one cache for the same server/library.
 
 ## 4. No In-Memory Metadata Cache
 

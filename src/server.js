@@ -2807,6 +2807,15 @@ function isLikelyPlexTrack(item) {
   return String(item?.type || '').toLowerCase() === 'track' && String(item?.ratingKey || '').length > 0;
 }
 
+function isPlayablePlexAudioTrack(item) {
+  if (!isLikelyPlexTrack(item)) {
+    return false;
+  }
+
+  const partKey = String(partFromTrack(item)?.key || '').trim();
+  return partKey.length > 0;
+}
+
 function isLikelyPlexAlbum(item) {
   return String(item?.type || '').toLowerCase() === 'album' && String(item?.ratingKey || '').length > 0;
 }
@@ -8533,8 +8542,21 @@ export async function buildServer(config = loadConfig()) {
       artistId: seed.artistId,
     });
 
-    const filtered = tracks.filter((track) => String(track?.ratingKey || '') !== seed.excludedTrackId);
-    return shuffleInPlace(filtered.slice()).slice(0, count);
+    const seen = new Set();
+    const filtered = [];
+    for (const track of tracks) {
+      const ratingKey = String(track?.ratingKey || '').trim();
+      if (!ratingKey || ratingKey === seed.excludedTrackId || seen.has(ratingKey)) {
+        continue;
+      }
+      if (!isPlayablePlexAudioTrack(track)) {
+        continue;
+      }
+      seen.add(ratingKey);
+      filtered.push(track);
+    }
+
+    return shuffleInPlace(filtered).slice(0, count);
   }
 
   app.route({
@@ -8573,8 +8595,13 @@ export async function buildServer(config = loadConfig()) {
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
         const songs = tracks.map((track) => songJson(track));
-        return sendSubsonicOk(reply, { similarSongs: songs });
+        return sendSubsonicOk(reply, {
+          similarSongs: songs.length > 0 ? { song: songs } : {},
+        });
       } catch (error) {
+        if (isPlexNotFoundError(error)) {
+          return sendSubsonicError(reply, 70, 'Item not found');
+        }
         request.log.error(error, 'Failed to load similar songs');
         return sendSubsonicError(reply, 10, 'Failed to load similar songs');
       }
@@ -8617,8 +8644,13 @@ export async function buildServer(config = loadConfig()) {
         applyCachedRatingOverridesForAccount({ accountId: account.id, plexState, items: tracks });
 
         const songs = tracks.map((track) => songJson(track));
-        return sendSubsonicOk(reply, { similarSongs2: songs });
+        return sendSubsonicOk(reply, {
+          similarSongs2: songs.length > 0 ? { song: songs } : {},
+        });
       } catch (error) {
+        if (isPlexNotFoundError(error)) {
+          return sendSubsonicError(reply, 70, 'Item not found');
+        }
         request.log.error(error, 'Failed to load similar songs2');
         return sendSubsonicError(reply, 10, 'Failed to load similar songs');
       }

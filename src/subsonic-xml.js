@@ -53,6 +53,8 @@ const ARRAY_CHILDREN_BY_PARENT = {
   songsByGenre: new Set(['song']),
   randomSongs: new Set(['song']),
   topSongs: new Set(['song']),
+  similarSongs: new Set(['song']),
+  similarSongs2: new Set(['song']),
   searchResult: new Set(['artist', 'album', 'match']),
   searchResult2: new Set(['artist', 'album', 'song']),
   searchResult3: new Set(['artist', 'album', 'song']),

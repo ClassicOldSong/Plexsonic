@@ -60,6 +60,9 @@ BIND_HOST=127.0.0.1
 BASE_URL=
 SQLITE_PATH=./data/app.db
 CACHE_SQLITE_PATH=./data/cache.db
+TRANSCODE_CACHE_PATH=./data/transcodes
+TRANSCODE_CLEANUP_INTERVAL_SEC=3600
+TRANSCODE_ARTIFACT_MAX_AGE_SEC=86400
 SESSION_SECRET=replace-with-a-long-random-secret
 TOKEN_ENC_KEY=
 PLEX_PRODUCT=Plexsonic Bridge
@@ -78,6 +81,9 @@ LOG_REQUESTS=0
 - `BASE_URL`: optional public URL override used for callback generation. If empty, origin is derived from request headers.
 - `SQLITE_PATH`: credentials/session/application database path.
 - `CACHE_SQLITE_PATH`: WAL-backed Plex metadata cache database path.
+- `TRANSCODE_CACHE_PATH`: local cache directory for ffmpeg-transcoded stream outputs.
+- `TRANSCODE_CLEANUP_INTERVAL_SEC`: periodic cleanup interval for transcode artifacts (`0` disables cleanup).
+- `TRANSCODE_ARTIFACT_MAX_AGE_SEC`: max artifact age before cleanup removes it (`0` disables cleanup).
 - `PLEX_WEBHOOK_TOKEN`: optional shared secret for `/webhooks/plex`. If set, webhook calls must provide this token.
 - `SESSION_SECRET`: cookie/session signing secret. Keep stable across restarts.
 - `TOKEN_ENC_KEY`: optional but recommended 32-byte key (hex or base64) used to encrypt stored Plex tokens.
@@ -93,6 +99,17 @@ openssl rand -hex 32
 # TOKEN_ENC_KEY (hex)
 openssl rand -hex 32
 ```
+
+## Streaming Transcode
+
+`/rest/stream.view` can transcode in-bridge (ffmpeg) to `mp3`, `aac`, `opus`, and `flac`.
+
+- `format` chooses target codec/container when supported (`mp3`, `aac`, `opus`, `flac`).
+- `maxBitRate` is respected for lossy outputs.
+- If only `maxBitRate` is provided, Plexsonic defaults to `opus` transcode.
+- `estimateContentLength` adds a best-effort `Content-Length` for uncached transcodes.
+- Transcode outputs are cached on disk (`TRANSCODE_CACHE_PATH`) to enable byte-range seeking on subsequent requests.
+- Cached transcode artifacts are auto-pruned by age (`TRANSCODE_CLEANUP_INTERVAL_SEC` / `TRANSCODE_ARTIFACT_MAX_AGE_SEC`).
 
 ## Run
 

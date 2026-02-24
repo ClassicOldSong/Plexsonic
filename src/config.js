@@ -28,6 +28,8 @@ const DEFAULT_PLEX_PRODUCT = 'Plexsonic Bridge';
 const DEFAULT_SESSION_SECRET = 'dev-session-secret-change-me-before-production-plexsonic';
 const DEFAULT_LOG_LEVEL = 'warn';
 const DEFAULT_LOG_REQUESTS = false;
+const DEFAULT_TRANSCODE_CLEANUP_INTERVAL_SECONDS = 3600;
+const DEFAULT_TRANSCODE_ARTIFACT_MAX_AGE_SECONDS = 86400;
 
 function parsePort(rawPort) {
   const value = Number.parseInt(rawPort ?? `${DEFAULT_PORT}`, 10);
@@ -57,6 +59,17 @@ function parseBoolean(value, fallback = false) {
   return ['1', 'true', 'yes', 'on'].includes(normalized);
 }
 
+function parseNonNegativeInt(value, fallback) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function normalizeOptionalBaseUrl(rawBaseUrl) {
   const value = String(rawBaseUrl || '').trim();
   if (!value) {
@@ -78,6 +91,15 @@ export function loadConfig(env = process.env) {
   const baseUrl = normalizeOptionalBaseUrl(env.BASE_URL);
   const sqlitePath = env.SQLITE_PATH || './data/app.db';
   const cacheSqlitePath = env.CACHE_SQLITE_PATH || './data/cache.db';
+  const transcodeCachePath = env.TRANSCODE_CACHE_PATH || './data/transcodes';
+  const transcodeCleanupIntervalSeconds = parseNonNegativeInt(
+    env.TRANSCODE_CLEANUP_INTERVAL_SEC,
+    DEFAULT_TRANSCODE_CLEANUP_INTERVAL_SECONDS,
+  );
+  const transcodeArtifactMaxAgeSeconds = parseNonNegativeInt(
+    env.TRANSCODE_ARTIFACT_MAX_AGE_SEC,
+    DEFAULT_TRANSCODE_ARTIFACT_MAX_AGE_SECONDS,
+  );
 
   return {
     bindHost,
@@ -85,6 +107,9 @@ export function loadConfig(env = process.env) {
     port,
     sqlitePath,
     cacheSqlitePath,
+    transcodeCachePath,
+    transcodeCleanupIntervalSeconds,
+    transcodeArtifactMaxAgeSeconds,
     sessionSecret: normalizeSessionSecret(env.SESSION_SECRET),
     tokenEncKey: env.TOKEN_ENC_KEY || null,
     plexInsecureTls: env.PLEX_INSECURE_TLS === '1',

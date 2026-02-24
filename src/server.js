@@ -18,7 +18,11 @@
  * under the License.
  */
 
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import Fastify from 'fastify';
 import argon2 from 'argon2';
@@ -100,6 +104,21 @@ const CACHE_PATCHABLE_PLEX_MEDIA_EVENTS = new Set([
   'media.rate',
   'media.unrate',
 ]);
+const TRANSCODE_SUPPORTED_FORMATS = new Set(['mp3', 'aac', 'opus', 'flac']);
+const TRANSCODE_DEFAULT_BITRATE_KBPS = {
+  mp3: 192,
+  aac: 256,
+  opus: 128,
+};
+const TRANSCODE_BITRATE_LIMITS_KBPS = {
+  mp3: { min: 32, max: 320 },
+  aac: { min: 32, max: 320 },
+  opus: { min: 24, max: 256 },
+};
+const TRANSCODE_CACHE_VERSION = 'v1';
+const RANGE_NOT_SATISFIABLE_BODY = 'invalid range: failed to overlap\n';
+const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 15000;
+const UPSTREAM_HEADERS_TIMEOUT_REASON = Symbol('upstream-headers-timeout');
 
 function applyCorsHeaders(request, reply) {
   const origin = firstForwardedValue(request.headers?.origin);
@@ -829,6 +848,929 @@ function detectContentType(track) {
     default:
       return 'audio/mpeg';
   }
+}
+
+function parseBooleanParam(value, fallback = false) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+  const normalized = safeLower(String(value).trim());
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function normalizeSourceAudioFormat(value) {
+  const normalized = safeLower(String(value || '').trim());
+  switch (normalized) {
+    case 'm4a':
+    case 'mp4':
+      return 'aac';
+    case 'ogg':
+      return 'opus';
+    default:
+      return normalized;
+  }
+}
+
+function normalizeRequestedTranscodeFormat(value) {
+  const normalized = safeLower(String(value || '').trim());
+  return TRANSCODE_SUPPORTED_FORMATS.has(normalized) ? normalized : '';
+}
+
+function defaultTranscodeBitrateKbps(format) {
+  return Number(TRANSCODE_DEFAULT_BITRATE_KBPS[format] || 0);
+}
+
+function normalizeTranscodeBitrateKbps(format, value) {
+  const limits = TRANSCODE_BITRATE_LIMITS_KBPS[format];
+  const fallback = defaultTranscodeBitrateKbps(format);
+  if (!limits) {
+    return fallback > 0 ? fallback : null;
+  }
+
+  const parsed = parsePositiveInt(value, fallback || limits.min);
+  const bounded = Math.min(limits.max, Math.max(limits.min, parsed));
+  return Number.isFinite(bounded) ? bounded : null;
+}
+
+function transcodeContentTypeForFormat(format) {
+  switch (format) {
+    case 'mp3':
+      return 'audio/mpeg';
+    case 'aac':
+      // Navidrome reports AAC transcodes as audio/mp4 even when encoded as ADTS.
+      return 'audio/mp4';
+    case 'opus':
+      return 'audio/ogg';
+    case 'flac':
+      return 'audio/flac';
+    default:
+      return 'audio/mpeg';
+  }
+}
+
+function transcodeSuffixForFormat(format) {
+  switch (format) {
+    case 'opus':
+      return 'ogg';
+    default:
+      return format || 'mp3';
+  }
+}
+
+function estimateTrackBitrateKbps(track) {
+  const partSizeBytes = parseNonNegativeInt(partFromTrack(track)?.size, 0);
+  const durationMs = parseNonNegativeInt(track?.duration, 0);
+  if (partSizeBytes <= 0 || durationMs <= 0) {
+    return 0;
+  }
+
+  const durationSeconds = durationMs / 1000;
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return 0;
+  }
+
+  const estimated = Math.round((partSizeBytes * 8) / durationSeconds / 1000);
+  if (!Number.isFinite(estimated) || estimated <= 0) {
+    return 0;
+  }
+  return estimated;
+}
+
+function detectSourceBitrateKbps(track) {
+  const fromMedia = parseNonNegativeInt(mediaFromTrack(track)?.bitrate, 0);
+  if (fromMedia > 0) {
+    return fromMedia;
+  }
+  return estimateTrackBitrateKbps(track);
+}
+
+function formatContentDurationHeader(durationMs) {
+  const parsed = Number(durationMs || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return '';
+  }
+  return (parsed / 1000).toFixed(3).replace(/\.?0+$/, '');
+}
+
+function estimateTranscodedContentLengthBytes({
+  format,
+  bitrateKbps,
+  durationMs,
+  sourceSize,
+}) {
+  const normalizedDuration = Number(durationMs || 0);
+  if (!Number.isFinite(normalizedDuration) || normalizedDuration <= 0) {
+    return null;
+  }
+
+  if (format === 'flac') {
+    const fallbackSize = parsePositiveInt(sourceSize, 0);
+    return fallbackSize > 0 ? fallbackSize : null;
+  }
+
+  const normalizedBitrate = Number(bitrateKbps || 0);
+  if (!Number.isFinite(normalizedBitrate) || normalizedBitrate <= 0) {
+    return null;
+  }
+
+  const seconds = normalizedDuration / 1000;
+  const baseline = seconds * normalizedBitrate * 125;
+  const overheadFactor = (() => {
+    switch (format) {
+      case 'mp3':
+        return 1.02;
+      case 'aac':
+        return 1.06;
+      case 'opus':
+        return 1.08;
+      default:
+        return 1.1;
+    }
+  })();
+  const estimated = Math.ceil((baseline * overheadFactor) + 4096);
+  if (!Number.isFinite(estimated) || estimated <= 0) {
+    return null;
+  }
+  return estimated;
+}
+
+function resolveStreamTranscodePlan({ request, track }) {
+  const requestedFormat = normalizeRequestedTranscodeFormat(getRequestParam(request, 'format'));
+  const requestedMaxBitRate = parsePositiveInt(getRequestParam(request, 'maxBitRate'), 0);
+  const estimateContentLength = parseBooleanParam(getRequestParam(request, 'estimateContentLength'), false);
+
+  const sourceFormat = normalizeSourceAudioFormat(detectAudioSuffix(track));
+  const sourceBitrateKbps = detectSourceBitrateKbps(track);
+
+  let targetFormat = '';
+  let bitrateKbps = null;
+  let shouldTranscode = false;
+
+  if (requestedFormat) {
+    targetFormat = requestedFormat;
+
+    if (targetFormat === 'flac') {
+      shouldTranscode = sourceFormat !== 'flac';
+    } else {
+      const targetBitrate = normalizeTranscodeBitrateKbps(
+        targetFormat,
+        requestedMaxBitRate > 0 ? requestedMaxBitRate : defaultTranscodeBitrateKbps(targetFormat),
+      );
+      bitrateKbps = targetBitrate;
+
+      if (sourceFormat !== targetFormat) {
+        shouldTranscode = true;
+      } else if (requestedMaxBitRate > 0) {
+        shouldTranscode = sourceBitrateKbps <= 0 || sourceBitrateKbps > (targetBitrate || requestedMaxBitRate);
+      }
+    }
+  } else if (requestedMaxBitRate > 0) {
+    const shouldLimitByBitrate = sourceBitrateKbps <= 0 || sourceBitrateKbps > requestedMaxBitRate;
+    if (shouldLimitByBitrate) {
+      targetFormat = 'opus';
+      bitrateKbps = normalizeTranscodeBitrateKbps('opus', requestedMaxBitRate);
+      shouldTranscode = true;
+    }
+  }
+
+  if (!shouldTranscode || !targetFormat) {
+    return null;
+  }
+
+  return {
+    targetFormat,
+    fileSuffix: transcodeSuffixForFormat(targetFormat),
+    contentType: transcodeContentTypeForFormat(targetFormat),
+    bitrateKbps,
+    estimateContentLength,
+  };
+}
+
+function buildTranscodeCacheKey({ plexState, part, track, trackId, plan }) {
+  const mediaFingerprint = [
+    TRANSCODE_CACHE_VERSION,
+    String(plexState?.machineId || ''),
+    String(part?.key || ''),
+    String(part?.size || ''),
+    String(track?.updatedAt || ''),
+    String(track?.duration || ''),
+    String(trackId || ''),
+    String(plan?.targetFormat || ''),
+    String(plan?.bitrateKbps || ''),
+  ].join('|');
+
+  return createHash('sha256').update(mediaFingerprint).digest('hex');
+}
+
+function buildTranscodeCachePaths(cacheRoot, cacheKey, fileSuffix) {
+  const bucket = cacheKey.slice(0, 2) || '00';
+  const directory = path.join(cacheRoot, bucket);
+  return {
+    directory,
+    filePath: path.join(directory, `${cacheKey}.${fileSuffix}`),
+    metaPath: path.join(directory, `${cacheKey}.json`),
+  };
+}
+
+async function readTranscodeCacheMetadata(metaPath) {
+  try {
+    const raw = await fsp.readFile(metaPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readReadyTranscodeCacheEntry({
+  cacheRoot,
+  cacheKey,
+  fileSuffix,
+}) {
+  const paths = buildTranscodeCachePaths(cacheRoot, cacheKey, fileSuffix);
+
+  try {
+    const stat = await fsp.stat(paths.filePath);
+    if (!stat.isFile() || stat.size <= 0) {
+      return { ...paths, size: 0, metadata: null, lastModified: '' };
+    }
+
+    const metadata = await readTranscodeCacheMetadata(paths.metaPath);
+    const lastModified = (() => {
+      const fromMeta = String(metadata?.lastModified || '').trim();
+      if (fromMeta) {
+        return fromMeta;
+      }
+      return stat.mtime instanceof Date ? stat.mtime.toUTCString() : '';
+    })();
+
+    return {
+      ...paths,
+      size: stat.size,
+      metadata,
+      lastModified,
+    };
+  } catch {
+    return {
+      ...paths,
+      size: 0,
+      metadata: null,
+      lastModified: '',
+    };
+  }
+}
+
+function parseSingleByteRange(rangeHeader, totalSize) {
+  const normalizedSize = Number(totalSize || 0);
+  if (!Number.isFinite(normalizedSize) || normalizedSize <= 0) {
+    return { unsatisfiable: true };
+  }
+
+  const raw = String(rangeHeader || '').trim();
+  if (!raw) {
+    return null;
+  }
+
+  if (!/^bytes=/i.test(raw)) {
+    return { unsatisfiable: true };
+  }
+
+  const firstSegment = raw.slice(raw.indexOf('=') + 1).split(',')[0]?.trim() || '';
+  const match = firstSegment.match(/^(\d*)-(\d*)$/);
+  if (!match) {
+    return { unsatisfiable: true };
+  }
+
+  const startRaw = match[1] || '';
+  const endRaw = match[2] || '';
+  if (!startRaw && !endRaw) {
+    return { unsatisfiable: true };
+  }
+
+  if (!startRaw) {
+    const suffixLength = Number.parseInt(endRaw, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+      return { unsatisfiable: true };
+    }
+    const start = Math.max(0, normalizedSize - suffixLength);
+    const end = normalizedSize - 1;
+    if (start > end) {
+      return { unsatisfiable: true };
+    }
+    return { start, end };
+  }
+
+  const start = Number.parseInt(startRaw, 10);
+  if (!Number.isFinite(start) || start < 0) {
+    return { unsatisfiable: true };
+  }
+  const parsedEnd = endRaw ? Number.parseInt(endRaw, 10) : normalizedSize - 1;
+  if (!Number.isFinite(parsedEnd) || parsedEnd < 0) {
+    return { unsatisfiable: true };
+  }
+
+  if (start >= normalizedSize || start > parsedEnd) {
+    return { unsatisfiable: true };
+  }
+
+  const end = Math.min(parsedEnd, normalizedSize - 1);
+  if (start > end) {
+    return { unsatisfiable: true };
+  }
+
+  return { start, end };
+}
+
+function waitForChildProcessSpawn(child) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const handleSpawn = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.off('error', handleError);
+      resolve();
+    };
+
+    const handleError = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.off('spawn', handleSpawn);
+      reject(error);
+    };
+
+    child.once('spawn', handleSpawn);
+    child.once('error', handleError);
+  });
+}
+
+function waitForWritableFinish(stream) {
+  return new Promise((resolve, reject) => {
+    if (!stream) {
+      resolve();
+      return;
+    }
+    if (stream.writableFinished || stream.destroyed) {
+      resolve();
+      return;
+    }
+
+    const handleFinish = () => {
+      stream.off('error', handleError);
+      resolve();
+    };
+    const handleError = (error) => {
+      stream.off('finish', handleFinish);
+      reject(error);
+    };
+
+    stream.once('finish', handleFinish);
+    stream.once('error', handleError);
+  });
+}
+
+function buildFfmpegTranscodeArgs(plan) {
+  const args = [
+    '-hide_banner',
+    '-loglevel', 'error',
+    '-nostdin',
+    '-i', 'pipe:0',
+    '-map', '0:a:0',
+    '-map_metadata', '0',
+    '-vn',
+  ];
+
+  if (plan.targetFormat === 'mp3') {
+    const bitrate = normalizeTranscodeBitrateKbps('mp3', plan.bitrateKbps);
+    args.push(
+      '-c:a', 'libmp3lame',
+      '-b:a', `${bitrate}k`,
+      '-minrate', `${bitrate}k`,
+      '-maxrate', `${bitrate}k`,
+      '-bufsize', `${Math.max(64, bitrate * 2)}k`,
+      '-id3v2_version', '4',
+      '-write_xing', '0',
+      '-f', 'mp3',
+      'pipe:1',
+    );
+    return args;
+  }
+
+  if (plan.targetFormat === 'aac') {
+    const bitrate = normalizeTranscodeBitrateKbps('aac', plan.bitrateKbps);
+    args.push(
+      '-c:a', 'aac',
+      '-b:a', `${bitrate}k`,
+      '-f', 'adts',
+      'pipe:1',
+    );
+    return args;
+  }
+
+  if (plan.targetFormat === 'opus') {
+    const bitrate = normalizeTranscodeBitrateKbps('opus', plan.bitrateKbps);
+    args.push(
+      '-c:a', 'libopus',
+      '-b:a', `${bitrate}k`,
+      '-vbr', 'on',
+      '-application', 'audio',
+      '-f', 'ogg',
+      'pipe:1',
+    );
+    return args;
+  }
+
+  args.push(
+    '-c:a', 'flac',
+    '-compression_level', '5',
+    '-f', 'flac',
+    'pipe:1',
+  );
+  return args;
+}
+
+async function serveCachedTranscodeResponse({
+  request,
+  reply,
+  cacheEntry,
+  plan,
+  durationHeader,
+}) {
+  const range = parseSingleByteRange(request.headers.range, cacheEntry.size);
+
+  if (range?.unsatisfiable) {
+    if (durationHeader) {
+      reply.header('x-content-duration', durationHeader);
+    }
+    reply.header('content-range', `bytes */${cacheEntry.size}`);
+    const payload = RANGE_NOT_SATISFIABLE_BODY;
+    return reply
+      .code(416)
+      .type('text/plain; charset=utf-8')
+      .header('content-length', String(Buffer.byteLength(payload)))
+      .send(payload);
+  }
+
+  if (durationHeader) {
+    reply.header('x-content-duration', durationHeader);
+  }
+  if (cacheEntry.lastModified) {
+    reply.header('last-modified', cacheEntry.lastModified);
+  }
+  reply.header('content-type', plan.contentType);
+  reply.header('accept-ranges', 'bytes');
+
+  if (range) {
+    const contentLength = (range.end - range.start) + 1;
+    reply.code(206);
+    reply.header('content-length', String(contentLength));
+    reply.header('content-range', `bytes ${range.start}-${range.end}/${cacheEntry.size}`);
+    return reply.send(fs.createReadStream(cacheEntry.filePath, {
+      start: range.start,
+      end: range.end,
+    }));
+  }
+
+  reply.code(200);
+  reply.header('content-length', String(cacheEntry.size));
+  return reply.send(fs.createReadStream(cacheEntry.filePath));
+}
+
+async function streamTrackWithLocalTranscode({
+  request,
+  reply,
+  plexState,
+  track,
+  trackId,
+  part,
+  partKey,
+  plan,
+  cacheRoot,
+}) {
+  const durationHeader = formatContentDurationHeader(track?.duration);
+  const cacheKey = buildTranscodeCacheKey({
+    plexState,
+    part,
+    track,
+    trackId,
+    plan,
+  });
+  const cacheEntry = await readReadyTranscodeCacheEntry({
+    cacheRoot,
+    cacheKey,
+    fileSuffix: plan.fileSuffix,
+  });
+
+  if (cacheEntry.size > 0) {
+    return serveCachedTranscodeResponse({
+      request,
+      reply,
+      cacheEntry,
+      plan,
+      durationHeader,
+    });
+  }
+
+  const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
+  const upstreamController = new AbortController();
+  let ffmpeg = null;
+  let transcodeAborted = false;
+
+  const abortTranscode = () => {
+    if (transcodeAborted) {
+      return;
+    }
+    transcodeAborted = true;
+
+    if (!upstreamController.signal.aborted) {
+      upstreamController.abort();
+    }
+
+    if (ffmpeg?.stdin && !ffmpeg.stdin.destroyed) {
+      try {
+        ffmpeg.stdin.destroy();
+      } catch { }
+    }
+
+    if (ffmpeg && ffmpeg.exitCode == null && ffmpeg.signalCode == null) {
+      try {
+        ffmpeg.kill('SIGKILL');
+      } catch { }
+    }
+  };
+
+  const abortTranscodeOnDisconnect = () => {
+    if (request.raw.aborted || !reply.raw.writableEnded) {
+      abortTranscode();
+    }
+  };
+  request.raw.once('aborted', abortTranscodeOnDisconnect);
+  reply.raw.once('close', abortTranscodeOnDisconnect);
+
+  const upstream = await fetchWithRetry({
+    url: streamUrl,
+    options: {
+      signal: upstreamController.signal,
+    },
+    request,
+    context: 'track transcode source',
+    maxAttempts: 3,
+    baseDelayMs: 250,
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    request.log.warn({ status: upstream.status, trackId }, 'Failed to read track source for transcoding');
+    return sendSubsonicError(reply, 70, 'Track stream unavailable');
+  }
+
+  const ffmpegArgs = buildFfmpegTranscodeArgs(plan);
+  try {
+    ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    await waitForChildProcessSpawn(ffmpeg);
+  } catch (error) {
+    abortTranscode();
+    request.log.error({ err: error, trackId }, 'Failed to start ffmpeg transcode process');
+    return sendSubsonicError(reply, 10, 'Transcode process unavailable');
+  }
+
+  const responseBody = new PassThrough();
+  const outputTee = new PassThrough();
+  const sourceLastModified = String(upstream.headers.get('last-modified') || '').trim();
+
+  let ffmpegErrorTail = '';
+  ffmpeg.stderr.on('data', (chunk) => {
+    ffmpegErrorTail = `${ffmpegErrorTail}${String(chunk)}`.slice(-4096);
+  });
+
+  let cacheTempPath = '';
+  let cacheWriteStream = null;
+  try {
+    await fsp.mkdir(cacheEntry.directory, { recursive: true });
+    cacheTempPath = `${cacheEntry.filePath}.tmp-${randomUUID()}`;
+    cacheWriteStream = fs.createWriteStream(cacheTempPath);
+    outputTee.pipe(cacheWriteStream);
+  } catch (error) {
+    request.log.debug(
+      { err: error, trackId, cacheFile: cacheEntry.filePath },
+      'Failed to initialize transcode cache writer',
+    );
+    cacheTempPath = '';
+    cacheWriteStream = null;
+  }
+
+  const cleanupTempCacheFile = async () => {
+    if (!cacheTempPath) {
+      return;
+    }
+    try {
+      await fsp.rm(cacheTempPath, { force: true });
+    } catch { }
+  };
+
+  if (cacheWriteStream) {
+    cacheWriteStream.on('error', (streamError) => {
+      request.log.debug(
+        { err: streamError, trackId, cacheFile: cacheEntry.filePath },
+        'Transcode cache write stream failed; disabling cache write for this request',
+      );
+      if (!outputTee.destroyed) {
+        outputTee.unpipe(cacheWriteStream);
+      }
+      if (!cacheWriteStream.destroyed) {
+        cacheWriteStream.destroy();
+      }
+      cacheWriteStream = null;
+      void cleanupTempCacheFile();
+    });
+  }
+
+  ffmpeg.once('close', (code, signal) => {
+    void (async () => {
+      const finishedSuccessfully = code === 0 && !transcodeAborted;
+
+      if (cacheWriteStream && !cacheWriteStream.writableEnded && !cacheWriteStream.destroyed) {
+        cacheWriteStream.end();
+      }
+
+      if (finishedSuccessfully && cacheWriteStream && cacheTempPath) {
+        try {
+          await waitForWritableFinish(cacheWriteStream);
+          await fsp.rename(cacheTempPath, cacheEntry.filePath);
+          cacheTempPath = '';
+
+          const cacheMetadata = {
+            version: TRANSCODE_CACHE_VERSION,
+            createdAt: Date.now(),
+            targetFormat: plan.targetFormat,
+            contentType: plan.contentType,
+            bitrateKbps: plan.bitrateKbps,
+            lastModified: sourceLastModified,
+            durationHeader: durationHeader || null,
+          };
+          await fsp.writeFile(cacheEntry.metaPath, `${JSON.stringify(cacheMetadata)}\n`, 'utf8');
+        } catch (error) {
+          request.log.debug(
+            { err: error, trackId, cacheFile: cacheEntry.filePath },
+            'Failed to persist transcoded cache entry',
+          );
+          await cleanupTempCacheFile();
+        }
+      } else {
+        await cleanupTempCacheFile();
+      }
+
+      if (finishedSuccessfully) {
+        if (!responseBody.destroyed) {
+          responseBody.end();
+        }
+        return;
+      }
+
+      if (isClientDisconnected(request, reply) || transcodeAborted) {
+        if (!responseBody.destroyed) {
+          responseBody.end();
+        }
+        return;
+      }
+
+      request.log.warn(
+        { trackId, code, signal, ffmpegError: ffmpegErrorTail.trim() || undefined },
+        'ffmpeg transcode process failed',
+      );
+      if (!responseBody.destroyed) {
+        responseBody.destroy(new Error('Transcode process failed'));
+      }
+    })();
+  });
+
+  ffmpeg.on('error', (error) => {
+    if (isClientDisconnected(request, reply) || transcodeAborted) {
+      return;
+    }
+    request.log.warn(error, 'ffmpeg process error while transcoding track');
+    responseBody.destroy(error);
+  });
+
+  const sourceReadable = Readable.fromWeb(upstream.body);
+  sourceReadable.on('error', (streamError) => {
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+      responseBody.end();
+      abortTranscode();
+      return;
+    }
+    request.log.warn(streamError, 'Upstream stream error while transcoding track');
+    responseBody.destroy(streamError);
+    abortTranscode();
+  });
+
+  ffmpeg.stdout.on('error', (streamError) => {
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+      responseBody.end();
+      return;
+    }
+    request.log.warn(streamError, 'ffmpeg output stream error while transcoding track');
+    responseBody.destroy(streamError);
+  });
+
+  ffmpeg.stdin.on('error', (streamError) => {
+    if (isClientDisconnected(request, reply) || transcodeAborted) {
+      return;
+    }
+    const code = String(streamError?.code || '').toUpperCase();
+    if (code === 'EPIPE' || code === 'ECONNRESET') {
+      return;
+    }
+    request.log.debug(streamError, 'ffmpeg input stream error while transcoding track');
+  });
+
+  responseBody.on('error', (streamError) => {
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+      return;
+    }
+    request.log.warn(streamError, 'Response stream error while transcoding track');
+    abortTranscode();
+  });
+
+  outputTee.on('error', (streamError) => {
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+      responseBody.end();
+      abortTranscode();
+      return;
+    }
+    request.log.warn(streamError, 'Transcode tee stream error while streaming track');
+    responseBody.destroy(streamError);
+    abortTranscode();
+  });
+
+  ffmpeg.stdout.pipe(outputTee);
+  outputTee.pipe(responseBody);
+  sourceReadable.pipe(ffmpeg.stdin);
+
+  reply.code(200);
+  reply.header('content-type', plan.contentType);
+  reply.header('accept-ranges', 'none');
+  if (durationHeader) {
+    reply.header('x-content-duration', durationHeader);
+  }
+
+  let shouldForceCloseAfterBodyEnd = false;
+  if (plan.estimateContentLength) {
+    const estimatedLength = estimateTranscodedContentLengthBytes({
+      format: plan.targetFormat,
+      bitrateKbps: plan.bitrateKbps,
+      durationMs: track?.duration,
+      sourceSize: part?.size,
+    });
+    if (estimatedLength != null) {
+      reply.header('content-length', String(estimatedLength));
+      shouldForceCloseAfterBodyEnd = true;
+    }
+  }
+
+  if (shouldForceCloseAfterBodyEnd) {
+    responseBody.once('end', () => {
+      try {
+        if (reply.raw.socket && !reply.raw.socket.destroyed) {
+          reply.raw.socket.destroy();
+        }
+      } catch { }
+    });
+    responseBody.once('error', () => {
+      try {
+        if (reply.raw.socket && !reply.raw.socket.destroyed) {
+          reply.raw.socket.destroy();
+        }
+      } catch { }
+    });
+    reply.raw.once('close', () => {
+      try {
+        if (reply.raw.socket && !reply.raw.socket.destroyed) {
+          reply.raw.socket.destroy();
+        }
+      } catch { }
+    });
+    }
+
+  return reply.send(responseBody);
+}
+
+async function pruneExpiredTranscodeArtifacts({
+  rootDir,
+  maxAgeMs,
+  nowMs = Date.now(),
+}) {
+  const normalizedRoot = String(rootDir || '').trim();
+  if (!normalizedRoot || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
+    return { removedFiles: 0, removedDirectories: 0 };
+  }
+
+  const cutoffMs = nowMs - maxAgeMs;
+  let removedFiles = 0;
+  let removedDirectories = 0;
+
+  const walk = async (dirPath, { isRoot = false } = {}) => {
+    let entries = [];
+    try {
+      entries = await fsp.readdir(dirPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      try {
+        const stats = await fsp.stat(fullPath);
+        if (stats.mtimeMs <= cutoffMs) {
+          await fsp.rm(fullPath, { force: true });
+          removedFiles += 1;
+        }
+      } catch { }
+    }
+
+    if (isRoot) {
+      return;
+    }
+
+    try {
+      const remaining = await fsp.readdir(dirPath);
+      if (remaining.length === 0) {
+        await fsp.rm(dirPath, { recursive: false });
+        removedDirectories += 1;
+      }
+    } catch { }
+  };
+
+  await walk(normalizedRoot, { isRoot: true });
+  return { removedFiles, removedDirectories };
+}
+
+function startTranscodeArtifactCleanupScheduler({
+  rootDir,
+  intervalMs,
+  maxAgeMs,
+  logger,
+}) {
+  const normalizedIntervalMs = Number(intervalMs || 0);
+  const normalizedMaxAgeMs = Number(maxAgeMs || 0);
+  if (
+    !Number.isFinite(normalizedIntervalMs) ||
+    normalizedIntervalMs <= 0 ||
+    !Number.isFinite(normalizedMaxAgeMs) ||
+    normalizedMaxAgeMs <= 0
+  ) {
+    return null;
+  }
+
+  const run = async () => {
+    try {
+      const result = await pruneExpiredTranscodeArtifacts({
+        rootDir,
+        maxAgeMs: normalizedMaxAgeMs,
+      });
+      if (result.removedFiles > 0 || result.removedDirectories > 0) {
+        logger.info(
+          {
+            removedFiles: result.removedFiles,
+            removedDirectories: result.removedDirectories,
+            rootDir,
+            maxAgeMs: normalizedMaxAgeMs,
+          },
+          'Removed expired transcode artifacts',
+        );
+      }
+    } catch (error) {
+      logger.warn({ err: error, rootDir, maxAgeMs: normalizedMaxAgeMs }, 'Transcode artifact cleanup failed');
+    }
+  };
+
+  void run();
+  const timer = setInterval(() => {
+    void run();
+  }, normalizedIntervalMs);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  return timer;
 }
 
 function durationSeconds(ms) {
@@ -2164,6 +3106,43 @@ function waitMs(ms) {
   });
 }
 
+function composeAbortSignals(signals) {
+  const filtered = signals.filter((signal) => signal && typeof signal === 'object');
+  if (filtered.length === 0) {
+    return undefined;
+  }
+  if (filtered.length === 1) {
+    return filtered[0];
+  }
+  if (typeof AbortSignal?.any === 'function') {
+    return AbortSignal.any(filtered);
+  }
+
+  const fallbackController = new AbortController();
+  const abortFallback = (event) => {
+    const signal = event?.target;
+    if (!fallbackController.signal.aborted) {
+      try {
+        fallbackController.abort(signal?.reason);
+      } catch {
+        fallbackController.abort();
+      }
+    }
+  };
+  for (const signal of filtered) {
+    if (signal.aborted) {
+      try {
+        fallbackController.abort(signal.reason);
+      } catch {
+        fallbackController.abort();
+      }
+      break;
+    }
+    signal.addEventListener('abort', abortFallback, { once: true });
+  }
+  return fallbackController.signal;
+}
+
 async function fetchWithRetry({
   url,
   options = {},
@@ -2171,12 +3150,38 @@ async function fetchWithRetry({
   context = 'upstream request',
   maxAttempts = 3,
   baseDelayMs = 200,
+  attemptHeadersTimeoutMs = DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS,
 }) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const externalSignal = options?.signal;
+    const attemptController = new AbortController();
+    let timeoutId = null;
+    let timedOut = false;
+
+    if (Number.isFinite(attemptHeadersTimeoutMs) && attemptHeadersTimeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        try {
+          attemptController.abort(UPSTREAM_HEADERS_TIMEOUT_REASON);
+        } catch {
+          attemptController.abort();
+        }
+      }, attemptHeadersTimeoutMs);
+      if (typeof timeoutId.unref === 'function') {
+        timeoutId.unref();
+      }
+    }
+
     try {
-      const response = await fetch(url, options);
+      const response = await fetch(url, {
+        ...options,
+        signal: composeAbortSignals([externalSignal, attemptController.signal]),
+      });
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
       if (!RETRYABLE_UPSTREAM_STATUSES.has(response.status) || attempt >= maxAttempts) {
         return response;
       }
@@ -2190,7 +3195,16 @@ async function fetchWithRetry({
         await response.body?.cancel?.();
       } catch { }
     } catch (error) {
-      if (isAbortError(error)) {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      if (externalSignal?.aborted) {
+        throw error;
+      }
+
+      const abortedForHeadersTimeout = timedOut || attemptController.signal.reason === UPSTREAM_HEADERS_TIMEOUT_REASON;
+      if (isAbortError(error) && !abortedForHeadersTimeout && attempt >= maxAttempts) {
         throw error;
       }
       lastError = error;
@@ -2199,7 +3213,14 @@ async function fetchWithRetry({
       }
 
       request?.log?.warn(
-        { context, attempt, maxAttempts, message: error?.message || String(error) },
+        {
+          context,
+          attempt,
+          maxAttempts,
+          message: error?.message || String(error),
+          headersTimeoutMs: attemptHeadersTimeoutMs,
+          headersTimeout: abortedForHeadersTimeout,
+        },
         'Transient upstream error, retrying',
       );
     }
@@ -2928,6 +3949,27 @@ export async function buildServer(config = loadConfig()) {
   app.decorate('db', db);
   app.decorate('cacheDb', cacheDb);
 
+  const transcodeCacheRoot = path.resolve(config.transcodeCachePath || './data/transcodes');
+  try {
+    await fsp.mkdir(transcodeCacheRoot, { recursive: true });
+  } catch (error) {
+    app.log.warn({ err: error, path: transcodeCacheRoot }, 'Failed to prepare transcode cache directory');
+  }
+  const transcodeCleanupIntervalMs = Math.max(
+    0,
+    Number(config.transcodeCleanupIntervalSeconds || 0) * 1000,
+  );
+  const transcodeArtifactMaxAgeMs = Math.max(
+    0,
+    Number(config.transcodeArtifactMaxAgeSeconds || 0) * 1000,
+  );
+  const transcodeArtifactCleanupTimer = startTranscodeArtifactCleanupScheduler({
+    rootDir: transcodeCacheRoot,
+    intervalMs: transcodeCleanupIntervalMs,
+    maxAgeMs: transcodeArtifactMaxAgeMs,
+    logger: app.log,
+  });
+
   if (!tokenCipher.hasExplicitKey) {
     app.log.warn('TOKEN_ENC_KEY missing or invalid. Falling back to hash of SESSION_SECRET for token encryption.');
   }
@@ -2959,6 +4001,9 @@ export async function buildServer(config = loadConfig()) {
   });
 
   app.addHook('onClose', async () => {
+    if (transcodeArtifactCleanupTimer) {
+      clearInterval(transcodeArtifactCleanupTimer);
+    }
     cacheDb.close();
     db.close();
   });
@@ -9977,7 +11022,14 @@ export async function buildServer(config = loadConfig()) {
         }
       }
 
-      return reply.send(Readable.fromWeb(upstream.body));
+      const proxiedBody = Readable.fromWeb(upstream.body);
+      proxiedBody.on('error', (streamError) => {
+        if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+          return;
+        }
+        request.log.warn(streamError, 'Upstream stream error while proxying cover art');
+      });
+      return reply.send(proxiedBody);
     } catch (error) {
       request.log.error(error, 'Failed to proxy cover art');
       return sendSubsonicError(reply, 10, 'Cover art proxy failed');
@@ -10001,8 +11053,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
+    let trackId = rawTrackId;
     try {
-      const trackId = await resolveCachedLibraryRatingKey({
+      trackId = await resolveCachedLibraryRatingKey({
         accountId: account.id,
         plexState,
         request,
@@ -10035,7 +11088,6 @@ export async function buildServer(config = loadConfig()) {
         }
       };
       request.raw.once('aborted', abortUpstreamOnDisconnect);
-      request.raw.once('close', abortUpstreamOnDisconnect);
       reply.raw.once('close', abortUpstreamOnDisconnect);
 
       const upstream = await fetchWithRetry({
@@ -10111,8 +11163,12 @@ export async function buildServer(config = loadConfig()) {
       proxiedBody.pipe(responseBody);
       return reply.send(responseBody);
     } catch (error) {
-      if (isAbortError(error) || isUpstreamTerminationError(error) || isClientDisconnected(request, reply)) {
+      if (isClientDisconnected(request, reply)) {
         return;
+      }
+      if (isAbortError(error) || isUpstreamTerminationError(error)) {
+        request.log.warn({ err: error, trackId }, 'Upstream download stream terminated before completion');
+        return sendSubsonicError(reply, 70, 'Track download unavailable');
       }
       request.log.error(error, 'Failed to proxy download');
       return sendSubsonicError(reply, 10, 'Download proxy failed');
@@ -10161,6 +11217,7 @@ export async function buildServer(config = loadConfig()) {
         return sendSubsonicError(reply, 70, 'Track has no playable part');
       }
 
+      const transcodePlan = resolveStreamTranscodePlan({ request, track });
       const clientName = getRequestParam(request, 'c') || 'Subsonic Client';
       const playbackClient = playbackClientContext(account.id, clientName);
       const { state: continuityState } = getPlaybackContinuityState(account.id, clientName);
@@ -10174,6 +11231,7 @@ export async function buildServer(config = loadConfig()) {
       const offsetSeconds = Number.parseFloat(offsetRaw);
       const offsetMs = Number.isFinite(offsetSeconds) && offsetSeconds > 0 ? Math.round(offsetSeconds * 1000) : 0;
       const trackDurationMs = parseNonNegativeInt(track.duration, 0);
+      const contentDurationHeader = formatContentDurationHeader(trackDurationMs);
       const playbackStartAt = Date.now();
 
       if (streamPlaybackAuthorityDisabled) {
@@ -10380,7 +11438,7 @@ export async function buildServer(config = loadConfig()) {
             trackId,
           });
           if (!stillSuppressed) {
-            await startStreamPlaybackTracking(estimatePlaybackPositionMs());
+            void startStreamPlaybackTracking(estimatePlaybackPositionMs());
             return;
           }
 
@@ -10394,14 +11452,28 @@ export async function buildServer(config = loadConfig()) {
           }
 
           // Fallback only for clients that never provide continuity signals.
-          await startStreamPlaybackTracking(estimatePlaybackPositionMs());
+          void startStreamPlaybackTracking(estimatePlaybackPositionMs());
         }, STREAM_SUPPRESSED_PROMOTE_DELAY_MS);
 
         if (typeof suppressedPromoteTimer.unref === 'function') {
           suppressedPromoteTimer.unref();
         }
       } else {
-        await startStreamPlaybackTracking(offsetMs);
+        void startStreamPlaybackTracking(offsetMs);
+      }
+
+      if (transcodePlan) {
+        return await streamTrackWithLocalTranscode({
+          request,
+          reply,
+          plexState,
+          track,
+          trackId,
+          part,
+          partKey,
+          plan: transcodePlan,
+          cacheRoot: transcodeCacheRoot,
+        });
       }
 
       const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
@@ -10413,7 +11485,6 @@ export async function buildServer(config = loadConfig()) {
         }
       };
       request.raw.once('aborted', abortUpstreamOnDisconnect);
-      request.raw.once('close', abortUpstreamOnDisconnect);
       reply.raw.once('close', abortUpstreamOnDisconnect);
 
       const upstream = await fetchWithRetry({
@@ -10452,6 +11523,9 @@ export async function buildServer(config = loadConfig()) {
           reply.header(headerName, value);
         }
       }
+      if (contentDurationHeader) {
+        reply.header('x-content-duration', contentDurationHeader);
+      }
 
       const proxiedBody = Readable.fromWeb(upstream.body);
       const responseBody = new PassThrough();
@@ -10477,12 +11551,16 @@ export async function buildServer(config = loadConfig()) {
       proxiedBody.pipe(responseBody);
       return reply.send(responseBody);
     } catch (error) {
-      if (isAbortError(error) || isUpstreamTerminationError(error) || isClientDisconnected(request, reply)) {
+      if (isClientDisconnected(request, reply)) {
         request.log.debug({ trackId }, 'Ignoring expected stream disconnect');
         return;
       }
-      request.log.error(error, 'Failed to proxy stream');
-      return sendSubsonicError(reply, 10, 'Stream proxy failed');
+      if (isAbortError(error) || isUpstreamTerminationError(error)) {
+        request.log.warn({ err: error, trackId }, 'Upstream stream terminated before completion');
+        return sendSubsonicError(reply, 70, 'Track stream unavailable');
+      }
+      request.log.error(error, 'Failed to stream track');
+      return sendSubsonicError(reply, 10, 'Track stream failed');
     }
   });
 

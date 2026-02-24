@@ -19,6 +19,8 @@ ENV NODE_ENV=production
 
 WORKDIR /app
 
+RUN apk add --no-cache ffmpeg
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src

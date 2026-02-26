@@ -297,6 +297,8 @@ export function migrateCache(db) {
       ON plex_library_cache_artists(cache_key, sort_key);
     CREATE INDEX IF NOT EXISTS idx_cache_artists_rating
       ON plex_library_cache_artists(cache_key, rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_artists_starred
+      ON plex_library_cache_artists(cache_key, user_rating, order_index);
 
     CREATE INDEX IF NOT EXISTS idx_cache_albums_order
       ON plex_library_cache_albums(cache_key, order_index);
@@ -306,6 +308,8 @@ export function migrateCache(db) {
       ON plex_library_cache_albums(cache_key, parent_rating_key);
     CREATE INDEX IF NOT EXISTS idx_cache_albums_rating
       ON plex_library_cache_albums(cache_key, rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_albums_starred
+      ON plex_library_cache_albums(cache_key, user_rating, order_index);
 
     CREATE INDEX IF NOT EXISTS idx_cache_album_genres_name
       ON plex_library_cache_album_genres(cache_key, genre_name);
@@ -320,6 +324,8 @@ export function migrateCache(db) {
       ON plex_library_cache_tracks(cache_key, grandparent_rating_key);
     CREATE INDEX IF NOT EXISTS idx_cache_tracks_rating
       ON plex_library_cache_tracks(cache_key, rating_key);
+    CREATE INDEX IF NOT EXISTS idx_cache_tracks_starred
+      ON plex_library_cache_tracks(cache_key, user_rating, order_index);
 
     CREATE INDEX IF NOT EXISTS idx_cache_track_genres_name
       ON plex_library_cache_track_genres(cache_key, genre_name);

@@ -29,7 +29,7 @@ const DEFAULT_SESSION_SECRET = 'dev-session-secret-change-me-before-production-p
 const DEFAULT_LOG_LEVEL = 'warn';
 const DEFAULT_LOG_REQUESTS = false;
 const DEFAULT_TRANSCODE_CLEANUP_INTERVAL_SECONDS = 3600;
-const DEFAULT_TRANSCODE_ARTIFACT_MAX_AGE_SECONDS = 86400;
+const DEFAULT_TRANSCODE_ARTIFACT_MAX_AGE_SECONDS = 604800;
 
 function parsePort(rawPort) {
   const value = Number.parseInt(rawPort ?? `${DEFAULT_PORT}`, 10);

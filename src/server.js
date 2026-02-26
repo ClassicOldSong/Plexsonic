@@ -115,7 +115,7 @@ const TRANSCODE_BITRATE_LIMITS_KBPS = {
   aac: { min: 32, max: 320 },
   opus: { min: 24, max: 256 },
 };
-const TRANSCODE_CACHE_VERSION = 'v1';
+const TRANSCODE_CACHE_VERSION = 'v2';
 const RANGE_NOT_SATISFIABLE_BODY = 'invalid range: failed to overlap\n';
 const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 15000;
 const UPSTREAM_HEADERS_TIMEOUT_REASON = Symbol('upstream-headers-timeout');
@@ -845,6 +845,10 @@ function detectContentType(track) {
       return 'audio/opus';
     case 'wav':
       return 'audio/wav';
+    case 'dsf':
+      return 'audio/x-dsf';
+    case 'dff':
+      return 'audio/x-dff';
     default:
       return 'audio/mpeg';
   }
@@ -956,48 +960,6 @@ function formatContentDurationHeader(durationMs) {
     return '';
   }
   return (parsed / 1000).toFixed(3).replace(/\.?0+$/, '');
-}
-
-function estimateTranscodedContentLengthBytes({
-  format,
-  bitrateKbps,
-  durationMs,
-  sourceSize,
-}) {
-  const normalizedDuration = Number(durationMs || 0);
-  if (!Number.isFinite(normalizedDuration) || normalizedDuration <= 0) {
-    return null;
-  }
-
-  if (format === 'flac') {
-    const fallbackSize = parsePositiveInt(sourceSize, 0);
-    return fallbackSize > 0 ? fallbackSize : null;
-  }
-
-  const normalizedBitrate = Number(bitrateKbps || 0);
-  if (!Number.isFinite(normalizedBitrate) || normalizedBitrate <= 0) {
-    return null;
-  }
-
-  const seconds = normalizedDuration / 1000;
-  const baseline = seconds * normalizedBitrate * 125;
-  const overheadFactor = (() => {
-    switch (format) {
-      case 'mp3':
-        return 1.02;
-      case 'aac':
-        return 1.06;
-      case 'opus':
-        return 1.08;
-      default:
-        return 1.1;
-    }
-  })();
-  const estimated = Math.ceil((baseline * overheadFactor) + 4096);
-  if (!Number.isFinite(estimated) || estimated <= 0) {
-    return null;
-  }
-  return estimated;
 }
 
 function resolveStreamTranscodePlan({ request, track }) {
@@ -1290,6 +1252,13 @@ function buildFfmpegTranscodeArgs(plan) {
     return args;
   }
 
+  const sourceFormat = normalizeSourceAudioFormat(plan?.sourceFormat || '');
+  if (sourceFormat === 'dsf' || sourceFormat === 'dff') {
+    // DSD-to-PCM defaults can produce 705.6kHz FLAC, which is very large and not broadly client-friendly.
+    // Keep a high-quality, broadly compatible rate for DSF/DFF -> FLAC.
+    args.push('-af', 'aresample=176400');
+  }
+
   args.push(
     '-c:a', 'flac',
     '-compression_level', '5',
@@ -1297,6 +1266,24 @@ function buildFfmpegTranscodeArgs(plan) {
     'pipe:1',
   );
   return args;
+}
+
+async function removeDirectoryIfEmpty(dirPath) {
+  const normalizedDir = String(dirPath || '').trim();
+  if (!normalizedDir) {
+    return false;
+  }
+
+  try {
+    const entries = await fsp.readdir(normalizedDir);
+    if (entries.length > 0) {
+      return false;
+    }
+    await fsp.rm(normalizedDir, { recursive: false });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function serveCachedTranscodeResponse({
@@ -1358,6 +1345,7 @@ async function streamTrackWithLocalTranscode({
   cacheRoot,
 }) {
   const durationHeader = formatContentDurationHeader(track?.duration);
+  const sourceFormat = normalizeSourceAudioFormat(detectAudioSuffix(track));
   const cacheKey = buildTranscodeCacheKey({
     plexState,
     part,
@@ -1433,7 +1421,10 @@ async function streamTrackWithLocalTranscode({
     return sendSubsonicError(reply, 70, 'Track stream unavailable');
   }
 
-  const ffmpegArgs = buildFfmpegTranscodeArgs(plan);
+  const ffmpegArgs = buildFfmpegTranscodeArgs({
+    ...plan,
+    sourceFormat,
+  });
   try {
     ffmpeg = spawn('ffmpeg', ffmpegArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1468,15 +1459,19 @@ async function streamTrackWithLocalTranscode({
     );
     cacheTempPath = '';
     cacheWriteStream = null;
+    void removeDirectoryIfEmpty(cacheEntry.directory);
   }
 
   const cleanupTempCacheFile = async () => {
-    if (!cacheTempPath) {
-      return;
-    }
+    const tempPath = cacheTempPath;
+    cacheTempPath = '';
+
     try {
-      await fsp.rm(cacheTempPath, { force: true });
+      if (tempPath) {
+        await fsp.rm(tempPath, { force: true });
+      }
     } catch { }
+    await removeDirectoryIfEmpty(cacheEntry.directory);
   };
 
   if (cacheWriteStream) {
@@ -1565,8 +1560,14 @@ async function streamTrackWithLocalTranscode({
 
   const sourceReadable = Readable.fromWeb(upstream.body);
   sourceReadable.on('error', (streamError) => {
-    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+    if (isClientDisconnected(request, reply) || transcodeAborted || upstreamController.signal.aborted) {
       responseBody.end();
+      abortTranscode();
+      return;
+    }
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError)) {
+      request.log.warn(streamError, 'Upstream source stream terminated during transcode');
+      responseBody.destroy(new Error('Upstream stream terminated during transcode'));
       abortTranscode();
       return;
     }
@@ -1576,12 +1577,18 @@ async function streamTrackWithLocalTranscode({
   });
 
   ffmpeg.stdout.on('error', (streamError) => {
-    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
-      responseBody.end();
+    if (isClientDisconnected(request, reply) || transcodeAborted) {
+      return;
+    }
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError)) {
+      request.log.warn(streamError, 'Transcode output stream terminated unexpectedly');
+      responseBody.destroy(new Error('Transcode output stream terminated'));
+      abortTranscode();
       return;
     }
     request.log.warn(streamError, 'ffmpeg output stream error while transcoding track');
     responseBody.destroy(streamError);
+    abortTranscode();
   });
 
   ffmpeg.stdin.on('error', (streamError) => {
@@ -1604,8 +1611,14 @@ async function streamTrackWithLocalTranscode({
   });
 
   outputTee.on('error', (streamError) => {
-    if (isAbortError(streamError) || isUpstreamTerminationError(streamError) || isClientDisconnected(request, reply)) {
+    if (isClientDisconnected(request, reply) || transcodeAborted) {
       responseBody.end();
+      abortTranscode();
+      return;
+    }
+    if (isAbortError(streamError) || isUpstreamTerminationError(streamError)) {
+      request.log.warn(streamError, 'Transcode tee stream terminated unexpectedly');
+      responseBody.destroy(new Error('Transcode stream terminated'));
       abortTranscode();
       return;
     }
@@ -1625,43 +1638,8 @@ async function streamTrackWithLocalTranscode({
     reply.header('x-content-duration', durationHeader);
   }
 
-  let shouldForceCloseAfterBodyEnd = false;
-  if (plan.estimateContentLength) {
-    const estimatedLength = estimateTranscodedContentLengthBytes({
-      format: plan.targetFormat,
-      bitrateKbps: plan.bitrateKbps,
-      durationMs: track?.duration,
-      sourceSize: part?.size,
-    });
-    if (estimatedLength != null) {
-      reply.header('content-length', String(estimatedLength));
-      shouldForceCloseAfterBodyEnd = true;
-    }
-  }
-
-  if (shouldForceCloseAfterBodyEnd) {
-    responseBody.once('end', () => {
-      try {
-        if (reply.raw.socket && !reply.raw.socket.destroyed) {
-          reply.raw.socket.destroy();
-        }
-      } catch { }
-    });
-    responseBody.once('error', () => {
-      try {
-        if (reply.raw.socket && !reply.raw.socket.destroyed) {
-          reply.raw.socket.destroy();
-        }
-      } catch { }
-    });
-    reply.raw.once('close', () => {
-      try {
-        if (reply.raw.socket && !reply.raw.socket.destroyed) {
-          reply.raw.socket.destroy();
-        }
-      } catch { }
-    });
-    }
+  // Keep live transcodes chunked. Inexact Content-Length guesses can truncate playback in strict clients.
+  // Cached transcodes still return exact Content-Length via serveCachedTranscodeResponse().
 
   return reply.send(responseBody);
 }

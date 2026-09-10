@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
+import { finished } from 'node:stream/promises';
 import Fastify from 'fastify';
 import argon2 from 'argon2';
 import fastifyCookie from '@fastify/cookie';
@@ -117,7 +118,9 @@ const TRANSCODE_BITRATE_LIMITS_KBPS = {
   aac: { min: 32, max: 320 },
   opus: { min: 24, max: 256 },
 };
-const TRANSCODE_CACHE_VERSION = 'v2';
+// Older entries may have been finalized before all buffered encoder output
+// reached disk. Regenerate them rather than replaying a truncated artifact.
+const TRANSCODE_CACHE_VERSION = 'v3';
 const RANGE_NOT_SATISFIABLE_BODY = 'invalid range: failed to overlap\n';
 const DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS = 15000;
 const UPSTREAM_HEADERS_TIMEOUT_REASON = Symbol('upstream-headers-timeout');
@@ -1178,31 +1181,6 @@ function waitForChildProcessSpawn(child) {
   });
 }
 
-function waitForWritableFinish(stream) {
-  return new Promise((resolve, reject) => {
-    if (!stream) {
-      resolve();
-      return;
-    }
-    if (stream.writableFinished || stream.destroyed) {
-      resolve();
-      return;
-    }
-
-    const handleFinish = () => {
-      stream.off('error', handleError);
-      resolve();
-    };
-    const handleError = (error) => {
-      stream.off('finish', handleFinish);
-      reject(error);
-    };
-
-    stream.once('finish', handleFinish);
-    stream.once('error', handleError);
-  });
-}
-
 function buildFfmpegTranscodeArgs(plan) {
   const args = [
     '-hide_banner',
@@ -1371,6 +1349,10 @@ async function streamTrackWithLocalTranscode({
   const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
   const upstreamController = new AbortController();
   let ffmpeg = null;
+  let ffmpegCompletion;
+  let responseBody;
+  let outputTee;
+  let cacheWriteStream = null;
   let transcodeAborted = false;
 
   const abortTranscode = () => {
@@ -1378,6 +1360,9 @@ async function streamTrackWithLocalTranscode({
       return;
     }
     transcodeAborted = true;
+    outputTee?.destroy();
+    cacheWriteStream?.destroy();
+    responseBody?.destroy();
 
     if (!upstreamController.signal.aborted) {
       upstreamController.abort();
@@ -1416,8 +1401,13 @@ async function streamTrackWithLocalTranscode({
   });
 
   if (!upstream.ok || !upstream.body) {
+    await upstream.body?.cancel();
     request.log.warn({ status: upstream.status, trackId }, 'Failed to read track source for transcoding');
     return sendSubsonicError(reply, 70, 'Track stream unavailable');
+  }
+  if (transcodeAborted) {
+    await upstream.body.cancel();
+    return reply;
   }
 
   const ffmpegArgs = buildFfmpegTranscodeArgs({
@@ -1428,15 +1418,27 @@ async function streamTrackWithLocalTranscode({
     ffmpeg = spawn('ffmpeg', ffmpegArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    // Register before awaiting spawn/cache I/O: short encodes can close while
+    // the cache directory is being opened. Process close alone is not drain.
+    ffmpegCompletion = new Promise((resolve) => {
+      ffmpeg.once('close', (code, signal) => resolve({ code, signal }));
+    });
     await waitForChildProcessSpawn(ffmpeg);
+    if (transcodeAborted) {
+      return reply;
+    }
   } catch (error) {
     abortTranscode();
     request.log.error({ err: error, trackId }, 'Failed to start ffmpeg transcode process');
     return sendSubsonicError(reply, 10, 'Transcode process unavailable');
   }
 
-  const responseBody = new PassThrough();
-  const outputTee = new PassThrough();
+  responseBody = new PassThrough();
+  outputTee = new PassThrough();
+  const outputFinished = finished(outputTee, { cleanup: true });
+  // A disconnect may reject before process close; completion below still owns
+  // that failure and must not publish a partially written cache entry.
+  outputFinished.catch(() => {});
   const sourceLastModified = String(upstream.headers.get('last-modified') || '').trim();
 
   let ffmpegErrorTail = '';
@@ -1445,9 +1447,12 @@ async function streamTrackWithLocalTranscode({
   });
 
   let cacheTempPath = '';
-  let cacheWriteStream = null;
   try {
     await fsp.mkdir(cacheEntry.directory, { recursive: true });
+    if (transcodeAborted) {
+      await removeDirectoryIfEmpty(cacheEntry.directory);
+      return reply;
+    }
     cacheTempPath = `${cacheEntry.filePath}.tmp-${randomUUID()}`;
     cacheWriteStream = fs.createWriteStream(cacheTempPath);
     outputTee.pipe(cacheWriteStream);
@@ -1465,6 +1470,13 @@ async function streamTrackWithLocalTranscode({
     const tempPath = cacheTempPath;
     cacheTempPath = '';
 
+    if (cacheWriteStream && !cacheWriteStream.closed) {
+      // A failed/destroyed stream can still own an open file descriptor.
+      // Its close event, rather than its error event, permits file removal.
+      const writerClosed = new Promise((resolve) => cacheWriteStream.once('close', resolve));
+      cacheWriteStream.destroy();
+      await writerClosed;
+    }
     try {
       if (tempPath) {
         await fsp.rm(tempPath, { force: true });
@@ -1485,68 +1497,63 @@ async function streamTrackWithLocalTranscode({
       if (!cacheWriteStream.destroyed) {
         cacheWriteStream.destroy();
       }
-      cacheWriteStream = null;
       void cleanupTempCacheFile();
     });
   }
 
-  ffmpeg.once('close', (code, signal) => {
-    void (async () => {
-      const finishedSuccessfully = code === 0 && !transcodeAborted;
-
-      if (cacheWriteStream && !cacheWriteStream.writableEnded && !cacheWriteStream.destroyed) {
-        cacheWriteStream.end();
+  void ffmpegCompletion.then(async ({ code, signal }) => {
+    if (code !== 0 || transcodeAborted) {
+      if (!transcodeAborted) {
+        request.log.warn(
+          { trackId, code, signal, ffmpegError: ffmpegErrorTail.trim() || undefined },
+          'ffmpeg transcode process failed',
+        );
       }
+      throw new Error('Transcode process failed');
+    }
+    // stdout can close with output still queued in the tee under socket
+    // backpressure. Only the tee's readable end proves both destinations
+    // have received every byte. pipe() alone ends the cache writer.
+    await outputFinished;
 
-      if (finishedSuccessfully && cacheWriteStream && cacheTempPath) {
-        try {
-          await waitForWritableFinish(cacheWriteStream);
-          await fsp.rename(cacheTempPath, cacheEntry.filePath);
-          cacheTempPath = '';
+    if (!transcodeAborted && cacheWriteStream && cacheTempPath) {
+      try {
+        await finished(cacheWriteStream, { cleanup: true });
+        await fsp.rename(cacheTempPath, cacheEntry.filePath);
+        cacheTempPath = '';
 
-          const cacheMetadata = {
-            version: TRANSCODE_CACHE_VERSION,
-            createdAt: Date.now(),
-            targetFormat: plan.targetFormat,
-            contentType: plan.contentType,
-            bitrateKbps: plan.bitrateKbps,
-            lastModified: sourceLastModified,
-            durationHeader: durationHeader || null,
-          };
-          await fsp.writeFile(cacheEntry.metaPath, `${JSON.stringify(cacheMetadata)}\n`, 'utf8');
-        } catch (error) {
-          request.log.debug(
-            { err: error, trackId, cacheFile: cacheEntry.filePath },
-            'Failed to persist transcoded cache entry',
-          );
-          await cleanupTempCacheFile();
-        }
-      } else {
+        const cacheMetadata = {
+          version: TRANSCODE_CACHE_VERSION,
+          createdAt: Date.now(),
+          targetFormat: plan.targetFormat,
+          contentType: plan.contentType,
+          bitrateKbps: plan.bitrateKbps,
+          lastModified: sourceLastModified,
+          durationHeader: durationHeader || null,
+        };
+        await fsp.writeFile(cacheEntry.metaPath, `${JSON.stringify(cacheMetadata)}\n`, 'utf8');
+      } catch (error) {
+        request.log.debug(
+          { err: error, trackId, cacheFile: cacheEntry.filePath },
+          'Failed to persist transcoded cache entry',
+        );
         await cleanupTempCacheFile();
       }
+    } else {
+      await cleanupTempCacheFile();
+    }
 
-      if (finishedSuccessfully) {
-        if (!responseBody.destroyed) {
-          responseBody.end();
-        }
-        return;
-      }
-
-      if (isClientDisconnected(request, reply) || transcodeAborted) {
-        if (!responseBody.destroyed) {
-          responseBody.end();
-        }
-        return;
-      }
-
-      request.log.warn(
-        { trackId, code, signal, ffmpegError: ffmpegErrorTail.trim() || undefined },
-        'ffmpeg transcode process failed',
-      );
-      if (!responseBody.destroyed) {
-        responseBody.destroy(new Error('Transcode process failed'));
-      }
-    })();
+    if (!responseBody.destroyed) {
+      responseBody.end();
+    }
+  }).catch(async (error) => {
+    request.log.debug({ err: error, trackId }, 'Transcode output did not finish');
+    responseBody.destroy(error);
+    abortTranscode();
+    await cleanupTempCacheFile();
+  }).finally(() => {
+    request.raw.off('aborted', abortTranscodeOnDisconnect);
+    reply.raw.off('close', abortTranscodeOnDisconnect);
   });
 
   ffmpeg.on('error', (error) => {
@@ -1627,7 +1634,9 @@ async function streamTrackWithLocalTranscode({
   });
 
   ffmpeg.stdout.pipe(outputTee);
-  outputTee.pipe(responseBody);
+  // Withhold successful HTTP EOF until the full output has drained and the
+  // encoder has exited successfully. end() then flushes the response's queue.
+  outputTee.pipe(responseBody, { end: false });
   sourceReadable.pipe(ffmpeg.stdin);
 
   reply.code(200);

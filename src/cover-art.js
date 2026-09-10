@@ -28,7 +28,7 @@ export async function resizeCoverArt(source, size, signal) {
       '-hide_banner', '-loglevel', 'error', '-nostdin',
       '-i', 'pipe:0',
       '-map', '0:v:0', '-frames:v', '1',
-      '-vf', `scale=w='min(${size},iw)':h='min(${size},ih)':force_original_aspect_ratio=decrease,setsar=1`,
+      '-vf', `crop=w='min(iw,ih)':h='min(iw,ih)':exact=1,scale=w='min(${size},iw)':h='min(${size},ih)',setsar=1`,
       '-threads', '1', '-c:v', 'png', '-f', 'image2pipe', 'pipe:1',
     ], {
       encoding: 'buffer',

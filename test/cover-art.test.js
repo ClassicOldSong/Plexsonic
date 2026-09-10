@@ -105,7 +105,7 @@ test('cover art sizes through authenticated GET and POST requests', async (t) =>
 
   let previousEtag;
   for (const [method, size, width, height] of [
-    ['GET', '80', 80, 40], ['POST', '40', 40, 20], ['GET', '1000', 320, 160],
+    ['GET', '80', 80, 80], ['POST', '40', 40, 40], ['GET', '1000', 160, 160],
   ]) {
     await t.test(`${method} size=${size}`, async () => {
       const query = new URLSearchParams({ ...params, size });
@@ -140,7 +140,7 @@ test('cover art sizes through authenticated GET and POST requests', async (t) =>
 
 test('portrait, square, transparency, and one-pixel output', async () => {
   for (const [dimensions, size, width, height] of [
-    ['160x320', 80, 40, 80], ['100x100', 33, 33, 33], ['320x160', 1, 1, 1],
+    ['160x320', 80, 80, 80], ['100x100', 33, 33, 33], ['320x160', 1, 1, 1],
   ]) {
     const image = await resizeCoverArt(Readable.from([makeImage(dimensions)]), size);
     const metadata = inspectImage(image);
@@ -151,6 +151,35 @@ test('portrait, square, transparency, and one-pixel output', async () => {
       '-v', 'error', '-i', 'pipe:0', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1',
     ], { input: image });
     assert.ok(pixels[3] > 0 && pixels[3] < 255, 'alpha must remain translucent');
+  }
+});
+
+test('non-square artwork crops the middle without stretching its contents', async () => {
+  for (const [width, height] of [[128, 64], [64, 128], [129, 65], [65, 129]]) {
+    const side = Math.min(width, height);
+    const source = execFileSync('ffmpeg', [
+      '-v', 'error', '-f', 'lavfi', '-i',
+      `color=blue:s=${width}x${height},format=rgba,` +
+      `drawbox=x=${(width - side) / 2}:y=${(height - side) / 2}:w=${side}:h=${side}:color=red:t=fill,` +
+      `drawbox=x=${(width - 9) / 2}:y=${(height - 9) / 2}:w=9:h=9:color=lime:t=fill`,
+      '-frames:v', '1', '-threads', '1', '-c:v', 'png', '-f', 'image2pipe', 'pipe:1',
+    ]);
+    // Keep native resolution so every pixel of the expected center crop is exact.
+    const image = await resizeCoverArt(Readable.from([source]), 1000);
+    const metadata = inspectImage(image);
+    assert.equal(metadata.width, side);
+    assert.equal(metadata.height, side);
+    const pixels = execFileSync('ffmpeg', [
+      '-v', 'error', '-i', 'pipe:0', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1',
+    ], { input: image });
+    const markerStart = Math.floor((side - 9) / 2);
+    for (let y = 0; y < side; y += 1) {
+      for (let x = 0; x < side; x += 1) {
+        const inside = x >= markerStart && x < markerStart + 9 && y >= markerStart && y < markerStart + 9;
+        const offset = (y * side + x) * 4;
+        assert.deepEqual([...pixels.subarray(offset, offset + 4)], inside ? [0, 255, 0, 255] : [255, 0, 0, 255]);
+      }
+    }
   }
 });
 

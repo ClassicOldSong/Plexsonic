@@ -22,8 +22,8 @@ To support this project, please subscribe to my [Patreon](https://www.patreon.co
 
 ## Requirements
 
-- Node.js 18+ (Node 20 recommended)
-- `pnpm`
+- Node.js 22.14+ (Node 24 recommended; Node 23 requires 23.6+)
+- `pnpm` 12.4.0, pinned in `package.json` (use Corepack to select it)
 - A reachable Plex Media Server with a music library
 - A Plex account with access to that server
 
@@ -107,13 +107,15 @@ openssl rand -hex 32
 - `format` chooses target codec/container when supported (`mp3`, `aac`, `opus`, `flac`).
 - `maxBitRate` is respected for lossy outputs.
 - If only `maxBitRate` is provided, Plexsonic defaults to `opus` transcode.
-- `estimateContentLength` adds a best-effort `Content-Length` for uncached transcodes.
+- Uncached transcodes start immediately with a chunked response and `Accept-Ranges: none`. `estimateContentLength` is accepted but does not add a guessed byte length, which can truncate playback.
+- `X-Content-Duration` reports the Plex track duration in seconds. Players must read this header or the song metadata explicitly; it is separate from HTTP `Content-Length` and embedded MP3 duration metadata.
 - Transcode outputs are cached on disk (`TRANSCODE_CACHE_PATH`) to enable byte-range seeking on subsequent requests.
+- Completed cached responses include an exact `Content-Length` and support `206` byte ranges. Live byte-range seeking is not yet supported; `timeOffset` currently adjusts playback reporting, not the encoded audio.
 - Cached transcode artifacts are auto-pruned by age (`TRANSCODE_CLEANUP_INTERVAL_SEC` / `TRANSCODE_ARTIFACT_MAX_AGE_SEC`).
 
 ## Cover Art Sizing
 
-`/rest/getCoverArt.view?id=...&size=300` uses ffmpeg to fit cover art within 300×300 pixels, preserving aspect ratio and transparency without enlarging smaller images. Resized images are returned as PNG with their own ETag and content length. The maximum requested size is capped at 4096 pixels; omitted, non-positive, or invalid sizes return the original image. Both GET and POST requests support `size`.
+`/rest/getCoverArt.view?id=...&size=300` uses ffmpeg to crop the center of cover art to a square, then resize it to at most 300×300 pixels. This preserves proportions and transparency without enlarging smaller images. Resized images are returned as PNG with their own ETag and content length. The maximum requested size is capped at 4096 pixels; omitted, non-positive, or invalid sizes return the original image. Both GET and POST requests support `size`.
 
 ## Run
 

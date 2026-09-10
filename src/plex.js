@@ -213,6 +213,7 @@ async function fetchAllMetadataPages({
   searchParams = null,
   signal = undefined,
   pageSize = 1000,
+  identityField = 'ratingKey',
 }) {
   const normalizedPageSize = Math.min(Math.max(Number.parseInt(String(pageSize), 10) || 1000, 1), 2000);
   const merged = [];
@@ -246,7 +247,7 @@ async function fetchAllMetadataPages({
 
     let added = 0;
     for (const item of page) {
-      const ratingKey = String(item?.ratingKey ?? '').trim();
+      const ratingKey = String(item?.[identityField] ?? '').trim();
       if (ratingKey) {
         if (seenRatingKeys.has(ratingKey)) {
           continue;
@@ -263,7 +264,7 @@ async function fetchAllMetadataPages({
     if (totalSize != null && start >= totalSize) {
       break;
     }
-    if (page.length < normalizedPageSize) {
+    if (totalSize == null && page.length < normalizedPageSize) {
       break;
     }
     if (added === 0) {
@@ -394,7 +395,14 @@ export async function listPlexServers(config, plexToken) {
 function joinBaseAndPath(baseUrl, relativePath) {
   const normalized = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
   const pathPart = relativePath.startsWith('/') ? relativePath.slice(1) : relativePath;
-  return new URL(pathPart, normalized);
+  const base = new URL(normalized);
+  const url = new URL(pathPart, base);
+  // Resolve with the URL parser before attaching tokens: network-path references
+  // and backslashes can otherwise switch hosts despite looking like relative paths.
+  if (url.origin !== base.origin) {
+    throw new Error('PMS path must remain on the configured server origin');
+  }
+  return url;
 }
 
 function normalizePlexTokenCandidates(plexToken) {
@@ -658,19 +666,22 @@ export async function renamePlexPlaylist({ baseUrl, plexToken, playlistId, title
 }
 
 export async function listPlexPlaylists({ baseUrl, plexToken }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, '/playlists', {
-    playlistType: 'audio',
+  return fetchAllMetadataPages({
+    baseUrl,
+    plexToken,
+    path: '/playlists',
+    searchParams: { playlistType: 'audio' },
   });
-  return extractMetadataList(payload.MediaContainer);
 }
 
 export async function listPlexPlaylistItems({ baseUrl, plexToken, playlistId }) {
-  const payload = await fetchPmsJson(
+  return fetchAllMetadataPages({
     baseUrl,
     plexToken,
-    `/playlists/${encodeURIComponent(playlistId)}/items`,
-  );
-  return extractMetadataList(payload.MediaContainer);
+    path: `/playlists/${encodeURIComponent(playlistId)}/items`,
+    // The same song can occur more than once in a playlist.
+    identityField: 'playlistItemID',
+  });
 }
 
 export async function deletePlexPlaylist({ baseUrl, plexToken, playlistId }) {
@@ -944,9 +955,15 @@ export async function probeSectionFingerprint({ baseUrl, plexToken, sectionId, s
   return `${sectionId}|${totalSize}|${ratingKey}|${updatedAt}|${addedAt}`;
 }
 
+export async function getMetadata({ baseUrl, plexToken, id, signal = undefined }) {
+  const payload = await fetchPmsJson(
+    baseUrl, plexToken, `/library/metadata/${encodeURIComponent(id)}`, null, { signal },
+  );
+  return extractMetadataList(payload.MediaContainer)[0] || null;
+}
+
 export async function getArtist({ baseUrl, plexToken, artistId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/metadata/${encodeURIComponent(artistId)}`);
-  const item = extractMetadataList(payload.MediaContainer)[0] || null;
+  const item = await getMetadata({ baseUrl, plexToken, id: artistId });
   if (!item) {
     return null;
   }
@@ -976,8 +993,7 @@ export async function listArtistTracks({ baseUrl, plexToken, artistId }) {
 }
 
 export async function getAlbum({ baseUrl, plexToken, albumId }) {
-  const payload = await fetchPmsJson(baseUrl, plexToken, `/library/metadata/${encodeURIComponent(albumId)}`);
-  const item = extractMetadataList(payload.MediaContainer)[0] || null;
+  const item = await getMetadata({ baseUrl, plexToken, id: albumId });
   if (!item) {
     return null;
   }
@@ -996,14 +1012,7 @@ export async function listAlbumTracks({ baseUrl, plexToken, albumId }) {
 }
 
 export async function getTrack({ baseUrl, plexToken, trackId, signal = undefined }) {
-  const payload = await fetchPmsJson(
-    baseUrl,
-    plexToken,
-    `/library/metadata/${encodeURIComponent(trackId)}`,
-    null,
-    { signal },
-  );
-  const item = extractMetadataList(payload.MediaContainer)[0] || null;
+  const item = await getMetadata({ baseUrl, plexToken, id: trackId, signal });
   if (!item) {
     return null;
   }

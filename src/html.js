@@ -639,13 +639,16 @@ export function testPage({ username }) {
             v: '1.16.1',
             f: 'json',
           });
-          const url = '/rest/' + endpoint + '?' + params.toString();
+          const url = '/rest/' + endpoint;
           out.textContent = 'Requesting ' + url + ' ...';
           try {
             const res = await fetch(url, {
+              method: 'POST',
+              body: params,
               cache: 'no-store',
               headers: {
                 Accept: 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
               },
             });
             const text = await res.text();

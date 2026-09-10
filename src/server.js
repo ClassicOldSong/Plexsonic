@@ -54,6 +54,7 @@ import {
   fetchPlexTrackLyricsCandidates,
   getAlbum,
   getArtist,
+  getMetadata,
   getTrack,
   listAlbums,
   listAlbumTracks,
@@ -1276,11 +1277,8 @@ async function removeDirectoryIfEmpty(dirPath) {
   }
 
   try {
-    const entries = await fsp.readdir(normalizedDir);
-    if (entries.length > 0) {
-      return false;
-    }
-    await fsp.rm(normalizedDir, { recursive: false });
+    // rmdir atomically refuses non-empty directories, including newly written cache files.
+    await fsp.rmdir(normalizedDir);
     return true;
   } catch {
     return false;
@@ -1690,13 +1688,9 @@ async function pruneExpiredTranscodeArtifacts({
       return;
     }
 
-    try {
-      const remaining = await fsp.readdir(dirPath);
-      if (remaining.length === 0) {
-        await fsp.rm(dirPath, { recursive: false });
-        removedDirectories += 1;
-      }
-    } catch { }
+    if (await removeDirectoryIfEmpty(dirPath)) {
+      removedDirectories += 1;
+    }
   };
 
   await walk(normalizedRoot, { isRoot: true });
@@ -3080,7 +3074,6 @@ function isUpstreamTerminationError(error) {
 function isClientDisconnected(request, reply) {
   return Boolean(
     request?.raw?.aborted ||
-    request?.raw?.destroyed ||
     reply?.raw?.destroyed ||
     reply?.raw?.writableEnded,
   );
@@ -4057,23 +4050,29 @@ export async function buildServer(config = loadConfig()) {
     )
     LIMIT 1
   `);
+  const getCollectionSyncStmt = cacheDb.prepare(`
+    SELECT last_synced_at FROM plex_library_cache_collection_state
+    WHERE cache_key = ? AND collection = ?
+  `);
+  const recordCollectionSyncStmt = cacheDb.prepare(`
+    INSERT INTO plex_library_cache_collection_state (cache_key, collection, last_synced_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(cache_key, collection) DO UPDATE SET last_synced_at = excluded.last_synced_at
+  `);
   const hasLibraryCacheArtistsStmt = cacheDb.prepare(`
-    SELECT 1 AS exists_flag
+    SELECT MIN(updated_cache_at) AS last_synced_at
     FROM plex_library_cache_artists
     WHERE cache_key = ?
-    LIMIT 1
   `);
   const hasLibraryCacheAlbumsStmt = cacheDb.prepare(`
-    SELECT 1 AS exists_flag
+    SELECT MIN(updated_cache_at) AS last_synced_at
     FROM plex_library_cache_albums
     WHERE cache_key = ?
-    LIMIT 1
   `);
   const hasLibraryCacheTracksStmt = cacheDb.prepare(`
-    SELECT 1 AS exists_flag
+    SELECT MIN(updated_cache_at) AS last_synced_at
     FROM plex_library_cache_tracks
     WHERE cache_key = ?
-    LIMIT 1
   `);
   const selectLibraryCacheArtistRowsStmt = cacheDb.prepare(`
     SELECT *
@@ -4235,11 +4234,13 @@ export async function buildServer(config = loadConfig()) {
   const selectTracksByGenreStmt = cacheDb.prepare(`
     SELECT t.*
     FROM plex_library_cache_tracks t
-    INNER JOIN plex_library_cache_track_genres g
-      ON g.cache_key = t.cache_key
-     AND g.track_rating_key = t.rating_key
     WHERE t.cache_key = @cache_key
-      AND lower(g.genre_name) = lower(@genre)
+      AND EXISTS (
+        SELECT 1 FROM plex_library_cache_track_genres g
+        WHERE g.cache_key = t.cache_key
+          AND g.track_rating_key = t.rating_key
+          AND lower(g.genre_name) = lower(@genre)
+      )
     ORDER BY
       lower(COALESCE(t.grandparent_title, '')) ASC,
       lower(COALESCE(t.parent_title, '')) ASC,
@@ -4577,6 +4578,12 @@ export async function buildServer(config = loadConfig()) {
     WHERE cache_key = @cache_key
     ORDER BY random()
     LIMIT @limit OFFSET @offset
+  `);
+  const selectRandomTrackRowsStmt = cacheDb.prepare(`
+    SELECT * FROM plex_library_cache_tracks
+    WHERE cache_key = ?
+    ORDER BY random()
+    LIMIT ?
   `);
   const countAlbumsRandomStmt = cacheDb.prepare(`
     SELECT COUNT(1) AS total
@@ -4975,6 +4982,7 @@ export async function buildServer(config = loadConfig()) {
     for (const row of rows) {
       insertLibraryCacheArtistStmt.run(row);
     }
+    recordCollectionSyncStmt.run(cacheKey, 'artists', nowSeconds);
     const currentState = getLibraryCacheStateStmt.get(cacheKey);
     upsertLibraryCacheStateStmt.run({
       cache_key: cacheKey,
@@ -4994,6 +5002,7 @@ export async function buildServer(config = loadConfig()) {
     for (const row of genreRows) {
       insertLibraryCacheAlbumGenreStmt.run(row);
     }
+    recordCollectionSyncStmt.run(cacheKey, 'albums', nowSeconds);
     const currentState = getLibraryCacheStateStmt.get(cacheKey);
     upsertLibraryCacheStateStmt.run({
       cache_key: cacheKey,
@@ -5021,6 +5030,7 @@ export async function buildServer(config = loadConfig()) {
     for (const row of albumArtistRows) {
       insertLibraryCacheTrackAlbumArtistStmt.run(row);
     }
+    recordCollectionSyncStmt.run(cacheKey, 'tracks', nowSeconds);
     const currentState = getLibraryCacheStateStmt.get(cacheKey);
     upsertLibraryCacheStateStmt.run({
       cache_key: cacheKey,
@@ -5314,18 +5324,26 @@ export async function buildServer(config = loadConfig()) {
   }
 
   function hasSearchBrowseCollectionPersistedData(cacheKey) {
-    return Boolean(hasLibraryCacheDataStmt.get(cacheKey, cacheKey, cacheKey));
+    return Boolean(getLibraryCacheStateStmt.get(cacheKey) || hasLibraryCacheDataStmt.get(cacheKey, cacheKey, cacheKey));
   }
 
   function hasPersistedCollectionData(cacheKey, collection) {
+    if (getCollectionSyncStmt.get(cacheKey, collection)) {
+      return true;
+    }
+    // Initialize older populated caches once, from this collection's own rows.
+    // A recent refresh of another collection must not extend their freshness.
+    let row;
     if (collection === 'artists') {
-      return Boolean(hasLibraryCacheArtistsStmt.get(cacheKey));
+      row = hasLibraryCacheArtistsStmt.get(cacheKey);
+    } else if (collection === 'albums') {
+      row = hasLibraryCacheAlbumsStmt.get(cacheKey);
+    } else if (collection === 'tracks') {
+      row = hasLibraryCacheTracksStmt.get(cacheKey);
     }
-    if (collection === 'albums') {
-      return Boolean(hasLibraryCacheAlbumsStmt.get(cacheKey));
-    }
-    if (collection === 'tracks') {
-      return Boolean(hasLibraryCacheTracksStmt.get(cacheKey));
+    if (row?.last_synced_at != null) {
+      recordCollectionSyncStmt.run(cacheKey, collection, row.last_synced_at);
+      return true;
     }
     return false;
   }
@@ -5577,40 +5595,38 @@ export async function buildServer(config = loadConfig()) {
     }
 
     const inFlightKey = `${cacheKey}:${collection}`;
-    const existing = cacheCollectionLoadInFlight.get(inFlightKey);
-    if (existing) {
-      return existing;
+    let pending = cacheCollectionLoadInFlight.get(inFlightKey);
+    if (!pending) {
+      pending = (async () => {
+        const result = await loader();
+        const loaded = Array.isArray(result) ? result : [];
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        if (collection === 'artists') {
+          const rows = buildArtistCacheRows(cacheKey, loaded, nowSeconds);
+          replaceArtistCacheTx(cacheKey, rows, nowSeconds);
+        } else if (collection === 'albums') {
+          const payload = buildAlbumCachePayload(cacheKey, loaded, nowSeconds);
+          replaceAlbumCacheTx(cacheKey, payload.albumRows, payload.genreRows, nowSeconds);
+        } else if (collection === 'tracks') {
+          const payload = buildTrackCachePayload(cacheKey, loaded, nowSeconds);
+          replaceTrackCacheTx(
+            cacheKey,
+            payload.trackRows,
+            payload.genreRows,
+            payload.artistRows,
+            payload.albumArtistRows,
+            nowSeconds,
+          );
+        } else {
+          throw new Error(`Invalid cache collection: ${collection}`);
+        }
+        return loaded;
+      })();
+      cacheCollectionLoadInFlight.set(inFlightKey, pending);
     }
 
-    const pending = (async () => {
-      const loaded = await loader();
-      return Array.isArray(loaded) ? loaded : [];
-    })();
-    cacheCollectionLoadInFlight.set(inFlightKey, pending);
-
     try {
-      const loaded = await pending;
-      const nowSeconds = Math.floor(Date.now() / 1000);
-      if (collection === 'artists') {
-        const rows = buildArtistCacheRows(cacheKey, loaded, nowSeconds);
-        replaceArtistCacheTx(cacheKey, rows, nowSeconds);
-      } else if (collection === 'albums') {
-        const payload = buildAlbumCachePayload(cacheKey, loaded, nowSeconds);
-        replaceAlbumCacheTx(cacheKey, payload.albumRows, payload.genreRows, nowSeconds);
-      } else if (collection === 'tracks') {
-        const payload = buildTrackCachePayload(cacheKey, loaded, nowSeconds);
-        replaceTrackCacheTx(
-          cacheKey,
-          payload.trackRows,
-          payload.genreRows,
-          payload.artistRows,
-          payload.albumArtistRows,
-          nowSeconds,
-        );
-      } else {
-        throw new Error(`Invalid cache collection: ${collection}`);
-      }
-      return loaded;
+      return await pending;
     } catch (error) {
       if (background) {
         request?.log?.debug(error, `Background refresh failed for ${collection} cache`);
@@ -5828,7 +5844,8 @@ export async function buildServer(config = loadConfig()) {
           await refreshSearchBrowseCollectionsForCacheKey({ cacheKey, plexState, request });
         } catch (error) {
           request?.log?.warn(error, `Failed to refresh stale cache for ${cacheKey}`);
-          throw error;
+          // Background callers do not await this promise. Keep the dirty flag so
+          // the next request retries, while both foreground and background serve stale data.
         } finally {
           if (cacheRefreshInFlight.get(cacheKey) === pending) {
             cacheRefreshInFlight.delete(cacheKey);
@@ -5842,11 +5859,7 @@ export async function buildServer(config = loadConfig()) {
     }
 
     if (wait && pending) {
-      try {
-        await pending;
-      } catch {
-        // Keep serving stale cache on refresh failures.
-      }
+      await pending;
     }
   }
 
@@ -5937,10 +5950,10 @@ export async function buildServer(config = loadConfig()) {
       wait: true,
     });
 
-    const cached = readSearchBrowseCollectionFromSqlite(cacheKey, collection);
+    const persisted = hasPersistedCollectionData(cacheKey, collection);
+    const cached = readSearchBrowseCollectionFromSqlite(cacheKey, collection) || (persisted ? [] : null);
     if (Array.isArray(cached)) {
-      const state = getPersistedLibraryCacheState(cacheKey);
-      const lastSyncedMs = Number(state.lastSyncedAt || 0) * 1000;
+      const lastSyncedMs = Number(getCollectionSyncStmt.get(cacheKey, collection)?.last_synced_at || 0) * 1000;
       const isStale = lastSyncedMs <= 0 || (now - lastSyncedMs) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
       if (isStale) {
         loadSearchBrowseCollection({
@@ -5954,10 +5967,6 @@ export async function buildServer(config = loadConfig()) {
         });
       }
       return cached;
-    }
-
-    if (hasPersistedCollectionData(cacheKey, collection)) {
-      return [];
     }
 
     return loadSearchBrowseCollection({
@@ -6018,8 +6027,7 @@ export async function buildServer(config = loadConfig()) {
       return cacheKey;
     }
 
-    const state = getPersistedLibraryCacheState(cacheKey);
-    const lastSyncedMs = Number(state.lastSyncedAt || 0) * 1000;
+    const lastSyncedMs = Number(getCollectionSyncStmt.get(cacheKey, collection)?.last_synced_at || 0) * 1000;
     const isStale = lastSyncedMs <= 0 || (now - lastSyncedMs) >= SEARCH_BROWSE_REVALIDATE_DEBOUNCE_MS;
     if (isStale) {
       loadSearchBrowseCollection({
@@ -6570,77 +6578,87 @@ export async function buildServer(config = loadConfig()) {
     }
 
     const pending = (async () => {
-      try {
-        const collectionsToWarm = SEARCH_BROWSE_COLLECTIONS.filter((collection) =>
-          forceRefresh || !hasPersistedCollectionData(cacheKey, collection),
-        );
-        if (collectionsToWarm.length === 0) {
-          app.log.debug({ cacheKey, accountId, reason }, 'Library cache warm-up skipped (already populated)');
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const collectionsToWarm = SEARCH_BROWSE_COLLECTIONS.filter((collection) =>
+            forceRefresh || !hasPersistedCollectionData(cacheKey, collection),
+          );
+          if (collectionsToWarm.length === 0) {
+            app.log.debug({ cacheKey, accountId, reason }, 'Library cache warm-up skipped (already populated)');
+            return;
+          }
+
+          const loaderCounts = {
+            artists: 0,
+            albums: 0,
+            tracks: 0,
+          };
+          for (const collection of collectionsToWarm) {
+            const loaded = await loadSearchBrowseCollection({
+              cacheKey,
+              collection,
+              loader: getLibraryCollectionLoader(collection, plexState),
+              request,
+              background: false,
+            });
+            loaderCounts[collection] = Array.isArray(loaded) ? loaded.length : 0;
+          }
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const state = getPersistedLibraryCacheState(cacheKey);
+          state.lastSyncedAt = Math.max(Number(state.lastSyncedAt || 0), nowSeconds);
+          state.dirty = false;
+          persistLibraryCacheState(cacheKey, state, nowSeconds);
+          app.log.info(
+            {
+              cacheKey,
+              accountId,
+              reason,
+              warmedCollections: collectionsToWarm,
+              artists: loaderCounts.artists,
+              albums: loaderCounts.albums,
+              tracks: loaderCounts.tracks,
+            },
+            'Library cache warm-up completed',
+          );
+          return;
+        } catch (error) {
+          if (attemptRecovery && attempt === 0) {
+            const recoveredState = await recoverWarmupPlexState({
+              accountId,
+              fallbackState: plexState,
+              request,
+            });
+            if (recoveredState) {
+              if (searchBrowseCacheKey(accountId, recoveredState) === cacheKey) {
+                plexState = recoveredState;
+                reason = `${reason}-recovered`;
+                continue;
+              }
+              return warmLibraryCacheForAccount({
+                accountId,
+                plexState: recoveredState,
+                reason: `${reason}-recovered`,
+                request,
+                attemptRecovery: false,
+                forceRefresh,
+              });
+            }
+          }
+          const logger = request?.log || app.log;
+          logger.warn({ err: error, cacheKey, accountId, reason }, 'Library cache warm-up failed');
           return;
         }
-
-        const loaderCounts = {
-          artists: 0,
-          albums: 0,
-          tracks: 0,
-        };
-        for (const collection of collectionsToWarm) {
-          const loaded = await loadSearchBrowseCollection({
-            cacheKey,
-            collection,
-            loader: getLibraryCollectionLoader(collection, plexState),
-            request,
-            background: false,
-          });
-          loaderCounts[collection] = Array.isArray(loaded) ? loaded.length : 0;
-        }
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const state = getPersistedLibraryCacheState(cacheKey);
-        state.lastSyncedAt = Math.max(Number(state.lastSyncedAt || 0), nowSeconds);
-        state.dirty = false;
-        persistLibraryCacheState(cacheKey, state, nowSeconds);
-        app.log.info(
-          {
-            cacheKey,
-            accountId,
-            reason,
-            warmedCollections: collectionsToWarm,
-            artists: loaderCounts.artists,
-            albums: loaderCounts.albums,
-            tracks: loaderCounts.tracks,
-          },
-          'Library cache warm-up completed',
-        );
-      } catch (error) {
-        if (attemptRecovery) {
-          const recoveredState = await recoverWarmupPlexState({
-            accountId,
-            fallbackState: plexState,
-            request,
-          });
-          if (recoveredState) {
-            return warmLibraryCacheForAccount({
-              accountId,
-              plexState: recoveredState,
-              reason: `${reason}-recovered`,
-              request,
-              attemptRecovery: false,
-              forceRefresh,
-            });
-          }
-        }
-        const logger = request?.log || app.log;
-        logger.warn({ err: error, cacheKey, accountId, reason }, 'Library cache warm-up failed');
       }
     })();
 
     cacheWarmupInFlight.set(cacheKey, pending);
-    pending.finally(() => {
+    try {
+      return await pending;
+    } finally {
       if (cacheWarmupInFlight.get(cacheKey) === pending) {
         cacheWarmupInFlight.delete(cacheKey);
       }
-    });
-    return pending;
+    }
   }
 
   async function warmAllLinkedLibraryCaches(reason = 'startup') {
@@ -6857,7 +6875,7 @@ export async function buildServer(config = loadConfig()) {
       collection: 'tracks',
     });
     const cachedById = new Map();
-    for (const id of orderedIds) {
+    for (const id of new Set(orderedIds)) {
       const metadataId = metadataPathRatingKey(id);
       let row = selectTrackRowByRatingKeyStmt.get(cacheKey, id) ||
         (metadataId ? selectTrackRowByRatingKeyStmt.get(cacheKey, metadataId) : null) ||
@@ -6883,13 +6901,13 @@ export async function buildServer(config = loadConfig()) {
       }
       const mapped = trackFromCacheRowWithRelations(cacheKey, row);
       const ratingKey = String(mapped?.ratingKey || '').trim();
-      if (ratingKey && !cachedById.has(ratingKey)) {
-        cachedById.set(ratingKey, mapped);
+      if (ratingKey) {
+        cachedById.set(id, mapped);
       }
     }
 
     const missingIds = [];
-    for (const id of orderedIds) {
+    for (const id of new Set(orderedIds)) {
       if (!cachedById.has(id)) {
         missingIds.push(id);
       }
@@ -6914,10 +6932,10 @@ export async function buildServer(config = loadConfig()) {
       const nonNullFetched = fetched.filter(Boolean);
       applyCachedRatingOverridesForAccount({ accountId, plexState, items: nonNullFetched });
 
-      for (const track of nonNullFetched) {
+      for (const [index, track] of fetched.entries()) {
         const ratingKey = String(track?.ratingKey || '').trim();
-        if (ratingKey && !cachedById.has(ratingKey)) {
-          cachedById.set(ratingKey, track);
+        if (ratingKey) {
+          cachedById.set(missingIds[index], track);
         }
       }
     }
@@ -8550,7 +8568,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const size = Math.min(parsePositiveInt(getQueryString(request, 'size'), 50), 500);
+    const size = Math.min(parsePositiveInt(getRequestParam(request, 'size'), 50), 500);
 
     const context = repo.getAccountPlexContext(account.id);
     const plexState = requiredPlexStateForSubsonic(reply, context, tokenCipher);
@@ -8559,9 +8577,11 @@ export async function buildServer(config = loadConfig()) {
     }
 
     try {
-      const allTracks = await getCachedLibraryTracks({ accountId: account.id, plexState, request });
-
-      const randomTracks = shuffleInPlace(allTracks.slice()).slice(0, size);
+      const cacheKey = await ensureSearchBrowseCollectionReady({
+        accountId: account.id, plexState, request, collection: 'tracks',
+      });
+      const randomTracks = selectRandomTrackRowsStmt.all(cacheKey, size)
+        .map((row) => trackFromCacheRowWithRelations(cacheKey, row));
       const songs = randomTracks.map((track) => songJson(track));
       return sendSubsonicOk(reply, { randomSongs: songs });
     } catch (error) {
@@ -11125,58 +11145,20 @@ export async function buildServer(config = loadConfig()) {
       let thumbPath = id.startsWith('/') ? id : null;
 
       if (!thumbPath) {
-        const [resolvedAlbumId, resolvedArtistId, resolvedTrackId] = await Promise.all([
-          resolveCachedLibraryRatingKey({
-            accountId: account.id,
-            plexState,
-            request,
-            collection: 'albums',
-            id,
-          }),
-          resolveCachedLibraryRatingKey({
-            accountId: account.id,
-            plexState,
-            request,
-            collection: 'artists',
-            id,
-          }),
-          resolveCachedLibraryRatingKey({
-            accountId: account.id,
-            plexState,
-            request,
-            collection: 'tracks',
-            id,
-          }),
-        ]);
-        const metadata = await getAlbum({
+        const resolvedId = await resolveCachedLibraryRatingKeyAnyCollection({
+          accountId: account.id,
+          plexState,
+          request,
+          id,
+          collections: ['albums', 'artists', 'tracks'],
+        });
+        const metadata = await getMetadata({
           baseUrl: plexState.baseUrl,
           plexToken: plexState.plexToken,
-          albumId: resolvedAlbumId || id,
+          id: resolvedId || id,
         });
 
-        if (metadata) {
-          thumbPath = metadata.thumb || metadata.art || null;
-        }
-
-        if (!thumbPath) {
-          const artist = await getArtist({
-            baseUrl: plexState.baseUrl,
-            plexToken: plexState.plexToken,
-            artistId: resolvedArtistId || id,
-          });
-
-          thumbPath = artist?.thumb || artist?.art || null;
-        }
-
-        if (!thumbPath) {
-          const track = await getTrack({
-            baseUrl: plexState.baseUrl,
-            plexToken: plexState.plexToken,
-            trackId: resolvedTrackId || id,
-          });
-
-          thumbPath = track?.thumb || track?.parentThumb || track?.grandparentThumb || null;
-        }
+        thumbPath = metadata?.thumb || metadata?.art || metadata?.parentThumb || metadata?.grandparentThumb || null;
       }
 
       if (!thumbPath) {
@@ -11253,7 +11235,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const rawTrackId = String(getQueryString(request, 'id') || '').trim();
+    const rawTrackId = String(getRequestParam(request, 'id') || '').trim();
     if (!rawTrackId) {
       return sendSubsonicError(reply, 70, 'Missing track id');
     }
@@ -11392,7 +11374,7 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
-    const rawTrackId = String(getQueryString(request, 'id') || '').trim();
+    const rawTrackId = String(getRequestParam(request, 'id') || '').trim();
     if (!rawTrackId) {
       return sendSubsonicError(reply, 70, 'Missing track id');
     }
@@ -11403,8 +11385,9 @@ export async function buildServer(config = loadConfig()) {
       return;
     }
 
+    let trackId = rawTrackId;
     try {
-      const trackId = await resolveCachedLibraryRatingKey({
+      trackId = await resolveCachedLibraryRatingKey({
         accountId: account.id,
         plexState,
         request,

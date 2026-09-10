@@ -22,6 +22,12 @@ State table:
   - One row per `cache_key`
   - Tracks `last_fingerprint`, `last_checked_at`, `last_synced_at`, `dirty`, `updated_at`
 
+Collection sync table:
+- `plex_library_cache_collection_state`
+  - One row per `(cache_key, collection)`, committed with that collection's replacement transaction.
+  - Records successful empty loads and tracks freshness separately for artists, albums, and tracks.
+  - Older populated caches acquire sync markers on first access using the oldest cached-row timestamp; metadata is retained.
+
 Entity tables:
 - `plex_library_cache_artists`
 - `plex_library_cache_albums`
@@ -125,6 +131,7 @@ These now query SQLite cache directly (paged SQL where applicable):
 - `/rest/getSongsByGenre.view`
 - `/rest/getAlbumList.view`
 - `/rest/getAlbumList2.view`
+- `/rest/getRandomSongs.view` (SQLite selects the requested sample before metadata is hydrated)
 
 ID resolution for `local://...`, `plex://...`, metadata paths, and numeric IDs is also cache-first.
 
@@ -143,6 +150,8 @@ Some endpoints still fetch Plex directly by design, especially:
 - Background refresh failure: continue serving persisted SQLite data
 - Dirty refresh with `wait: true`: failures are swallowed to preserve availability
 - If a collection was previously synced and is truly empty, return empty list without forced reload
+- Concurrent collection readers share the complete load-and-persist operation.
+- Warm-up retries with recovered connection details under the same pending operation when the library key is unchanged.
 
 ## 13. Cache Schema Compatibility Note
 

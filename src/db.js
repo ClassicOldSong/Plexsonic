@@ -143,11 +143,19 @@ export function migrateCache(db) {
         DROP TABLE IF EXISTS plex_library_cache_albums;
         DROP TABLE IF EXISTS plex_library_cache_artists;
         DROP TABLE IF EXISTS plex_library_cache_state;
+        DROP TABLE IF EXISTS plex_library_cache_collection_state;
       `);
     }
   }
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS plex_library_cache_collection_state (
+      cache_key TEXT NOT NULL,
+      collection TEXT NOT NULL,
+      last_synced_at INTEGER NOT NULL,
+      PRIMARY KEY (cache_key, collection)
+    );
+
     CREATE TABLE IF NOT EXISTS plex_library_cache_state (
       cache_key TEXT PRIMARY KEY,
       last_fingerprint TEXT NOT NULL DEFAULT '',

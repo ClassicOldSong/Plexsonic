@@ -111,6 +111,10 @@ openssl rand -hex 32
 - Transcode outputs are cached on disk (`TRANSCODE_CACHE_PATH`) to enable byte-range seeking on subsequent requests.
 - Cached transcode artifacts are auto-pruned by age (`TRANSCODE_CLEANUP_INTERVAL_SEC` / `TRANSCODE_ARTIFACT_MAX_AGE_SEC`).
 
+## Cover Art Sizing
+
+`/rest/getCoverArt.view?id=...&size=300` uses ffmpeg to fit cover art within 300×300 pixels, preserving aspect ratio and transparency without enlarging smaller images. Resized images are returned as PNG with their own ETag and content length. The maximum requested size is capped at 4096 pixels; omitted, non-positive, or invalid sizes return the original image. Both GET and POST requests support `size`.
+
 ## Run
 
 ```bash

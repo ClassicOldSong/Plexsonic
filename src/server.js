@@ -31,6 +31,7 @@ import fastifyFormbody from '@fastify/formbody';
 import fastifyMultipart from '@fastify/multipart';
 import fastifySession from '@fastify/session';
 import { loadConfig } from './config.js';
+import { resizeCoverArt } from './cover-art.js';
 import { createRepositories, migrate, migrateCache, openDatabase } from './db.js';
 import {
   decodeChoicePayload,
@@ -11183,11 +11184,41 @@ export async function buildServer(config = loadConfig()) {
       }
 
       const assetUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, thumbPath);
-      const upstream = await fetch(assetUrl);
+      const requestedSize = Number(getRequestParam(request, 'size'));
+      // Bound per-request image work; absent/invalid sizes retain the original image.
+      const size = Number.isSafeInteger(requestedSize) && requestedSize > 0
+        ? Math.min(requestedSize, 4096)
+        : 0;
+      const controller = new AbortController();
+      const abortOnDisconnect = () => {
+        controller.abort();
+        request.raw.off('aborted', abortOnDisconnect);
+        reply.raw.off('close', abortOnDisconnect);
+      };
+      // Keep cancellation attached until a streamed original also finishes.
+      request.raw.once('aborted', abortOnDisconnect);
+      reply.raw.once('close', abortOnDisconnect);
+      if (request.raw.aborted || reply.raw.destroyed) {
+        abortOnDisconnect();
+      }
+
+      const upstream = await fetch(assetUrl, { signal: controller.signal });
 
       if (!upstream.ok || !upstream.body) {
+        await upstream.body?.cancel();
         request.log.warn({ status: upstream.status }, 'Failed to proxy cover art');
         return sendSubsonicError(reply, 70, 'Cover art not found');
+      }
+
+      if (size > 0) {
+        const image = await resizeCoverArt(Readable.fromWeb(upstream.body), size, controller.signal);
+        reply.type('image/png');
+        reply.header('etag', `"${createHash('sha256').update(image).digest('hex')}"`);
+        const cacheControl = upstream.headers.get('cache-control');
+        if (cacheControl) {
+          reply.header('cache-control', cacheControl);
+        }
+        return reply.send(image);
       }
 
       reply.code(upstream.status);
@@ -11208,6 +11239,9 @@ export async function buildServer(config = loadConfig()) {
       });
       return reply.send(proxiedBody);
     } catch (error) {
+      if (request.raw.aborted || reply.raw.destroyed) {
+        return;
+      }
       request.log.error(error, 'Failed to proxy cover art');
       return sendSubsonicError(reply, 10, 'Cover art proxy failed');
     }

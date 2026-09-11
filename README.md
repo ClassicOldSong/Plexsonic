@@ -108,9 +108,11 @@ openssl rand -hex 32
 - `maxBitRate` is respected for lossy outputs.
 - If only `maxBitRate` is provided, Plexsonic defaults to `opus` transcode.
 - Uncached transcodes start immediately with a chunked response and `Accept-Ranges: none`. `estimateContentLength` is accepted but does not add a guessed byte length, which can truncate playback.
-- `X-Content-Duration` reports the Plex track duration in seconds. Players must read this header or the song metadata explicitly; it is separate from HTTP `Content-Length` and embedded MP3 duration metadata.
+- `X-Content-Duration` reports the response's audio duration in seconds (the remaining duration after a time offset). Players must read this header or the song metadata explicitly; it is separate from HTTP `Content-Length` and embedded MP3 duration metadata.
 - Transcode outputs are cached on disk (`TRANSCODE_CACHE_PATH`) to enable byte-range seeking on subsequent requests.
-- Completed cached responses include an exact `Content-Length` and support `206` byte ranges. Live byte-range seeking is not yet supported; `timeOffset` currently adjusts playback reporting, not the encoded audio.
+- Completed cached responses include an exact `Content-Length` and support `206` byte ranges.
+- The OpenSubsonic `transcodeOffset` v1 extension supports seeking before a transcode is cached: reopen `/rest/stream` with `timeOffset` in seconds. Decimal offsets are rounded to the nearest millisecond; negative, invalid, and known end-of-track or later offsets are rejected. The new audio stream starts at local time zero, so clients should add the applied offset to their playback clock and retain the original track duration. Do not seek the decoder by that offset a second time.
+- Offset responses are chunked, do not support byte ranges, and never replace the full-song cache. FFmpeg decodes and discards the source prefix, so later seeks can take longer to start. Specify a supported `format` to retain the desired codec; if neither format nor bitrate policy selects an output codec, offset requests use FLAC. `format=raw` with a positive offset is rejected; use byte ranges for original files.
 - Cached transcode artifacts are auto-pruned by age (`TRANSCODE_CLEANUP_INTERVAL_SEC` / `TRANSCODE_ARTIFACT_MAX_AGE_SEC`).
 
 ## Cover Art Sizing

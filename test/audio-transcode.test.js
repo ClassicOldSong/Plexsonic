@@ -101,9 +101,8 @@ for (const format of ['flac', 'mp3']) {
         assert.equal(report.finalCompleted, true, 'ended must wait for the sink to finish');
         reports.push(report);
       }
-      // mpg123 currently reports zero for an unknown pipe length; providers may
-      // also expose null. Neither is a usable duration for this nonempty source.
-      assert.ok(reports[0].before.durationUs == null || reports[0].before.durationUs === 0);
+      // Resonance uses X-Content-Duration when the pipe MP3 has no known length.
+      assert.equal(reports[0].before.durationUs, duration * 1000000);
       assert.equal(reports[0].before.seekable, false);
       assert.ok(reports[1].before.durationUs > 0);
       assert.equal(reports[1].before.seekable, true);

@@ -293,7 +293,9 @@ function normalizeInner(inner) {
   for (const [key, value] of Object.entries(inner)) {
     if (Array.isArray(value)) {
       const childName = defaultArrayChildName(key);
-      if (childName && key !== 'artists' && key !== 'albumArtists') {
+      // Extensions are a top-level array in the OpenSubsonic JSON schema;
+      // their XML child rule must not introduce an extra JSON wrapper.
+      if (childName && key !== 'artists' && key !== 'albumArtists' && key !== 'openSubsonicExtensions') {
         out[key] = { [childName]: value };
       } else {
         out[key] = value;

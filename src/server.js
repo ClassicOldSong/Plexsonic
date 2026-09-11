@@ -98,7 +98,7 @@ const DEFAULT_CORS_ALLOW_HEADERS = [
   'X-Plex-Model',
 ].join(', ');
 const DEFAULT_CORS_ALLOW_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
-const DEFAULT_CORS_EXPOSE_HEADERS = 'content-type, content-length, content-range, accept-ranges, etag, last-modified';
+const DEFAULT_CORS_EXPOSE_HEADERS = 'content-type, content-length, content-range, accept-ranges, x-content-duration, etag, last-modified';
 const CACHE_INVALIDATING_PLEX_MEDIA_EVENTS = new Set([
   'media.add',
   'media.delete',
@@ -967,7 +967,7 @@ function formatContentDurationHeader(durationMs) {
   return (parsed / 1000).toFixed(3).replace(/\.?0+$/, '');
 }
 
-function resolveStreamTranscodePlan({ request, track }) {
+function resolveStreamTranscodePlan({ request, track, offsetMs = 0 }) {
   const requestedFormat = normalizeRequestedTranscodeFormat(getRequestParam(request, 'format'));
   const requestedMaxBitRate = parsePositiveInt(getRequestParam(request, 'maxBitRate'), 0);
   const estimateContentLength = parseBooleanParam(getRequestParam(request, 'estimateContentLength'), false);
@@ -1004,6 +1004,13 @@ function resolveStreamTranscodePlan({ request, track }) {
       bitrateKbps = normalizeTranscodeBitrateKbps('opus', requestedMaxBitRate);
       shouldTranscode = true;
     }
+  }
+
+  if (offsetMs > 0) {
+    // An offset needs a fresh, independently decodable stream even when the
+    // original codec matches. Use FLAC if no output codec was selected above.
+    shouldTranscode = true;
+    targetFormat ||= 'flac';
   }
 
   if (!shouldTranscode || !targetFormat) {
@@ -1192,6 +1199,12 @@ function buildFfmpegTranscodeArgs(plan) {
     '-vn',
   ];
 
+  if (plan.offsetMs > 0) {
+    // The authenticated source is a pipe. Output-side seeking decodes and
+    // discards the prefix accurately without assuming byte offsets or an index.
+    args.push('-ss', `${plan.offsetMs}ms`);
+  }
+
   if (plan.targetFormat === 'mp3') {
     const bitrate = normalizeTranscodeBitrateKbps('mp3', plan.bitrateKbps);
     args.push(
@@ -1320,30 +1333,37 @@ async function streamTrackWithLocalTranscode({
   partKey,
   plan,
   cacheRoot,
+  offsetMs = 0,
 }) {
-  const durationHeader = formatContentDurationHeader(track?.duration);
+  const durationHeader = formatContentDurationHeader(Number(track?.duration || 0) - offsetMs);
   const sourceFormat = normalizeSourceAudioFormat(detectAudioSuffix(track));
-  const cacheKey = buildTranscodeCacheKey({
-    plexState,
-    part,
-    track,
-    trackId,
-    plan,
-  });
-  const cacheEntry = await readReadyTranscodeCacheEntry({
-    cacheRoot,
-    cacheKey,
-    fileSuffix: plan.fileSuffix,
-  });
-
-  if (cacheEntry.size > 0) {
-    return serveCachedTranscodeResponse({
-      request,
-      reply,
-      cacheEntry,
+  let cacheEntry;
+  if (offsetMs === 0) {
+    const cacheKey = buildTranscodeCacheKey({
+      plexState,
+      part,
+      track,
+      trackId,
       plan,
-      durationHeader,
     });
+    cacheEntry = await readReadyTranscodeCacheEntry({
+      cacheRoot,
+      cacheKey,
+      fileSuffix: plan.fileSuffix,
+    });
+    if (isClientDisconnected(request, reply)) {
+      return reply;
+    }
+
+    if (cacheEntry.size > 0) {
+      return serveCachedTranscodeResponse({
+        request,
+        reply,
+        cacheEntry,
+        plan,
+        durationHeader,
+      });
+    }
   }
 
   const streamUrl = buildPmsAssetUrl(plexState.baseUrl, plexState.plexToken, partKey);
@@ -1413,6 +1433,7 @@ async function streamTrackWithLocalTranscode({
   const ffmpegArgs = buildFfmpegTranscodeArgs({
     ...plan,
     sourceFormat,
+    offsetMs,
   });
   try {
     ffmpeg = spawn('ffmpeg', ffmpegArgs, {
@@ -1447,23 +1468,26 @@ async function streamTrackWithLocalTranscode({
   });
 
   let cacheTempPath = '';
-  try {
-    await fsp.mkdir(cacheEntry.directory, { recursive: true });
-    if (transcodeAborted) {
-      await removeDirectoryIfEmpty(cacheEntry.directory);
-      return reply;
+  // A seek response is only a suffix, never the full cached representation.
+  if (offsetMs === 0) {
+    try {
+      await fsp.mkdir(cacheEntry.directory, { recursive: true });
+      if (transcodeAborted) {
+        await removeDirectoryIfEmpty(cacheEntry.directory);
+        return reply;
+      }
+      cacheTempPath = `${cacheEntry.filePath}.tmp-${randomUUID()}`;
+      cacheWriteStream = fs.createWriteStream(cacheTempPath);
+      outputTee.pipe(cacheWriteStream);
+    } catch (error) {
+      request.log.debug(
+        { err: error, trackId, cacheFile: cacheEntry.filePath },
+        'Failed to initialize transcode cache writer',
+      );
+      cacheTempPath = '';
+      cacheWriteStream = null;
+      void removeDirectoryIfEmpty(cacheEntry.directory);
     }
-    cacheTempPath = `${cacheEntry.filePath}.tmp-${randomUUID()}`;
-    cacheWriteStream = fs.createWriteStream(cacheTempPath);
-    outputTee.pipe(cacheWriteStream);
-  } catch (error) {
-    request.log.debug(
-      { err: error, trackId, cacheFile: cacheEntry.filePath },
-      'Failed to initialize transcode cache writer',
-    );
-    cacheTempPath = '';
-    cacheWriteStream = null;
-    void removeDirectoryIfEmpty(cacheEntry.directory);
   }
 
   const cleanupTempCacheFile = async () => {
@@ -1482,7 +1506,7 @@ async function streamTrackWithLocalTranscode({
         await fsp.rm(tempPath, { force: true });
       }
     } catch { }
-    await removeDirectoryIfEmpty(cacheEntry.directory);
+    if (offsetMs === 0) await removeDirectoryIfEmpty(cacheEntry.directory);
   };
 
   if (cacheWriteStream) {
@@ -8194,8 +8218,12 @@ export async function buildServer(config = loadConfig()) {
       {
         openSubsonicExtensions: [
           {
-          name: 'songLyrics',
-          versions: [1],
+            name: 'songLyrics',
+            versions: [1],
+          },
+          {
+            name: 'transcodeOffset',
+            versions: [1],
           },
         ],
       },
@@ -11420,7 +11448,24 @@ export async function buildServer(config = loadConfig()) {
         return sendSubsonicError(reply, 70, 'Track has no playable part');
       }
 
-      const transcodePlan = resolveStreamTranscodePlan({ request, track });
+      // A superseding seek can close this request while metadata is loading,
+      // before the transcode's own disconnect listeners have been installed.
+      if (isClientDisconnected(request, reply)) {
+        return reply;
+      }
+
+      const offsetRaw = getRequestParam(request, 'timeOffset');
+      const offsetSeconds = Number(offsetRaw ?? 0);
+      const offsetMs = Math.round(offsetSeconds * 1000);
+      const trackDurationMs = parseNonNegativeInt(track.duration, 0);
+      if (!Number.isFinite(offsetSeconds) || offsetSeconds < 0 || !Number.isSafeInteger(offsetMs)
+          || (offsetMs > 0 && trackDurationMs > 0 && offsetMs >= trackDurationMs)) {
+        return sendSubsonicError(reply, 10, 'timeOffset must be a nonnegative number before the end of the track');
+      }
+      if (offsetMs > 0 && safeLower(String(getRequestParam(request, 'format') || '').trim()) === 'raw') {
+        return sendSubsonicError(reply, 10, 'timeOffset requires transcoding; use byte ranges with format=raw');
+      }
+      const transcodePlan = resolveStreamTranscodePlan({ request, track, offsetMs });
       const clientName = getRequestParam(request, 'c') || 'Subsonic Client';
       const playbackClient = playbackClientContext(account.id, clientName);
       const { state: continuityState } = getPlaybackContinuityState(account.id, clientName);
@@ -11430,10 +11475,6 @@ export async function buildServer(config = loadConfig()) {
         clientName,
         trackId,
       }) || streamPlaybackAuthorityDisabled;
-      const offsetRaw = getRequestParam(request, 'timeOffset');
-      const offsetSeconds = Number.parseFloat(offsetRaw);
-      const offsetMs = Number.isFinite(offsetSeconds) && offsetSeconds > 0 ? Math.round(offsetSeconds * 1000) : 0;
-      const trackDurationMs = parseNonNegativeInt(track.duration, 0);
       const contentDurationHeader = formatContentDurationHeader(trackDurationMs);
       const playbackStartAt = Date.now();
 
@@ -11676,6 +11717,7 @@ export async function buildServer(config = loadConfig()) {
           partKey,
           plan: transcodePlan,
           cacheRoot: transcodeCacheRoot,
+          offsetMs,
         });
       }
 

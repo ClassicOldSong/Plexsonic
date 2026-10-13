@@ -25,6 +25,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
+import { MIMEType } from 'node:util';
 import Fastify from 'fastify';
 import argon2 from 'argon2';
 import fastifyCookie from '@fastify/cookie';
@@ -1323,6 +1324,142 @@ async function serveCachedTranscodeResponse({
   return reply.send(fs.createReadStream(cacheEntry.filePath));
 }
 
+async function* readTranscodeSource({ upstream, url, signal, request, trackId }) {
+  let response = upstream;
+  let deliveredBytes = 0;
+  let retries = 0;
+  let rangeEnd = null;
+  const lengthHeader = upstream.headers.get('content-length');
+  let totalBytes = lengthHeader === null ? null : Number(lengthHeader);
+  const etag = upstream.headers.get('etag');
+  const lastModified = upstream.headers.get('last-modified');
+  const modifiedAt = Date.parse(lastModified);
+  const responseDate = Date.parse(upstream.headers.get('date'));
+  // Fetch and installed dependencies expose no parsed ETag/Content-Range API.
+  // This is RFC 9110 8.8.3's complete strong opaque-tag grammar (no escapes).
+  // A weak/malformed tag cannot authorize recombining partial representations.
+  let ifRange = etag && /^"[\x21\x23-\x7e\x80-\xff]*"$/.test(etag) ? etag : '';
+  if (etag === null && Number.isFinite(modifiedAt) && lastModified === new Date(modifiedAt).toUTCString()
+      && responseDate - modifiedAt >= 60000) {
+    // RFC 9110 8.8.2.2: conservatively allow a date validator only when the
+    // origin's Date is at least a minute later, avoiding same-second ambiguity.
+    ifRange = lastModified;
+  }
+  if ((upstream.headers.get('content-encoding') || 'identity').toLowerCase() !== 'identity'
+      || (totalBytes !== null && !Number.isSafeInteger(totalBytes))) {
+    // Fetch transparently decompresses bodies; decoded offsets are not HTTP
+    // representation byte offsets. Such responses retain prefix verification.
+    ifRange = '';
+  }
+  const deliveredHash = createHash('sha256');
+  for (;;) {
+    // A validated 206 starts exactly at deliveredBytes. A full response must
+    // replay/verify its prefix, including servers that ignored Range/If-Range.
+    let remainingPrefix = rangeEnd === null ? deliveredBytes : 0;
+    const expectedHash = remainingPrefix ? deliveredHash.copy().digest() : null;
+    const prefixHash = remainingPrefix ? createHash('sha256') : null;
+    try {
+      for await (const chunk of response.body) {
+        signal.throwIfAborted();
+        let next = chunk;
+        if (remainingPrefix > 0) {
+          const count = Math.min(remainingPrefix, next.length);
+          prefixHash.update(next.subarray(0, count));
+          remainingPrefix -= count;
+          next = next.subarray(count);
+          if (remainingPrefix === 0 && !prefixHash.digest().equals(expectedHash)) {
+            throw new Error('Plex source changed while recovering the transcode input');
+          }
+        }
+        if (next.length) {
+          if (rangeEnd !== null && deliveredBytes + next.length > rangeEnd) {
+            throw new Error('Plex source recovery exceeded its Content-Range');
+          }
+          deliveredHash.update(next);
+          deliveredBytes += next.length;
+          yield next;
+        }
+      }
+      if (remainingPrefix > 0) {
+        throw new Error('Plex source became shorter while recovering the transcode input');
+      }
+      if (rangeEnd !== null && deliveredBytes !== rangeEnd) {
+        // A chunked response can end cleanly while lying about its range size.
+        // Recover from the actual consumed position, never publish a short cache.
+        throw new Error('Upstream source stream terminated before its Content-Range completed');
+      }
+      return;
+    } catch (error) {
+      if (signal.aborted || !isUpstreamTerminationError(error) || retries >= 2) throw error;
+      retries++;
+      const resumeRange = Boolean(ifRange && deliveredBytes > 0 && (totalBytes === null || deliveredBytes < totalBytes));
+      request.log.warn(
+        { err: error, trackId, sourceBytes: deliveredBytes, retry: retries, maxRetries: 2,
+          recovery: resumeRange ? 'range' : 'verified-prefix' },
+        'Plex source disconnected; verifying a replacement before continuing transcode',
+      );
+      await waitMs(250 * retries);
+      signal.throwIfAborted();
+      response = await fetchWithRetry({
+        url,
+        // Fetch automatically appends Accept-Encoding: identity for Range.
+        // Set it ourselves only for full downloads to avoid duplicate values.
+        options: { signal, headers: resumeRange
+          ? { Range: `bytes=${deliveredBytes}-`, 'If-Range': ifRange }
+          : { 'Accept-Encoding': 'identity' } },
+        request,
+        context: 'track transcode source recovery',
+        maxAttempts: 3,
+        baseDelayMs: 250,
+      });
+      if ((response.status !== 200 && !(resumeRange && response.status === 206)) || !response.body) {
+        await response.body?.cancel();
+        throw new Error(`Plex source recovery returned HTTP ${response.status}`);
+      }
+      // Validators identify the complete representation, but a 206 Content-Length
+      // describes only the suffix. Never compare it to the original full length.
+      const identityHeaders = response.status === 206 ? ['etag', 'last-modified'] : ['etag', 'last-modified', 'content-length'];
+      for (const name of identityHeaders) {
+        const original = upstream.headers.get(name);
+        const replacement = response.headers.get(name);
+        // RFC 9110 15.3.7 permits omitting Last-Modified after If-Range matched.
+        // ETag is still required if it would have appeared in the full response.
+        if (response.status === 206 && name === 'last-modified' && replacement === null) continue;
+        if (original && replacement !== original) {
+          await response.body.cancel();
+          throw new Error(`Plex source ${name} changed while recovering the transcode input`);
+        }
+      }
+      rangeEnd = null;
+      if (response.status === 206) {
+        let contentType;
+        try {
+          contentType = new MIMEType(response.headers.get('content-type') || 'application/octet-stream');
+        } catch {
+          await response.body.cancel();
+          throw new Error('Plex source recovery returned an invalid Content-Type');
+        }
+        // Bounded RFC 9110 14.4 grammar: one bytes range with a known total.
+        // Multipart, wildcard totals, other units and trailing syntax are not
+        // accepted. Our existing Range parser is for requests, not this header.
+        const match = /^bytes (\d+)-(\d+)\/(\d+)$/i.exec(response.headers.get('content-range') || '');
+        const [start, end, total] = match ? match.slice(1).map(Number) : [];
+        const suffixLength = response.headers.get('content-length');
+        if (contentType.type === 'multipart' || !match || ![start, end, total].every(Number.isSafeInteger)
+            || start !== deliveredBytes || end < start || end !== total - 1
+            || (totalBytes !== null && total !== totalBytes)
+            || (suffixLength !== null && Number(suffixLength) !== total - start)
+            || (response.headers.get('content-encoding') || 'identity').toLowerCase() !== 'identity') {
+          await response.body.cancel();
+          throw new Error('Plex source recovery returned an invalid Content-Range response');
+        }
+        totalBytes = total;
+        rangeEnd = total;
+      }
+    }
+  }
+}
+
 async function streamTrackWithLocalTranscode({
   request,
   reply,
@@ -1370,6 +1507,7 @@ async function streamTrackWithLocalTranscode({
   const upstreamController = new AbortController();
   let ffmpeg = null;
   let ffmpegCompletion;
+  let sourceReadable;
   let responseBody;
   let outputTee;
   let cacheWriteStream = null;
@@ -1380,6 +1518,7 @@ async function streamTrackWithLocalTranscode({
       return;
     }
     transcodeAborted = true;
+    sourceReadable?.destroy();
     outputTee?.destroy();
     cacheWriteStream?.destroy();
     responseBody?.destroy();
@@ -1413,6 +1552,7 @@ async function streamTrackWithLocalTranscode({
     url: streamUrl,
     options: {
       signal: upstreamController.signal,
+      headers: { 'Accept-Encoding': 'identity' },
     },
     request,
     context: 'track transcode source',
@@ -1588,7 +1728,13 @@ async function streamTrackWithLocalTranscode({
     responseBody.destroy(error);
   });
 
-  const sourceReadable = Readable.fromWeb(upstream.body);
+  sourceReadable = Readable.from(readTranscodeSource({
+    upstream,
+    url: streamUrl,
+    signal: upstreamController.signal,
+    request,
+    trackId,
+  }), { objectMode: false });
   sourceReadable.on('error', (streamError) => {
     if (isClientDisconnected(request, reply) || transcodeAborted || upstreamController.signal.aborted) {
       responseBody.end();
@@ -1596,12 +1742,12 @@ async function streamTrackWithLocalTranscode({
       return;
     }
     if (isAbortError(streamError) || isUpstreamTerminationError(streamError)) {
-      request.log.warn(streamError, 'Upstream source stream terminated during transcode');
+      request.log.warn({ err: streamError, trackId, offsetMs }, 'Upstream source stream terminated during transcode');
       responseBody.destroy(new Error('Upstream stream terminated during transcode'));
       abortTranscode();
       return;
     }
-    request.log.warn(streamError, 'Upstream stream error while transcoding track');
+    request.log.warn({ err: streamError, trackId, offsetMs }, 'Upstream stream error while transcoding track');
     responseBody.destroy(streamError);
     abortTranscode();
   });

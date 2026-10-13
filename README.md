@@ -108,6 +108,7 @@ openssl rand -hex 32
 - `maxBitRate` is respected for lossy outputs.
 - If only `maxBitRate` is provided, Plexsonic defaults to `opus` transcode.
 - Uncached transcodes start immediately with a chunked response and `Accept-Ranges: none`. `estimateContentLength` is accepted but does not add a guessed byte length, which can truncate playback.
+- Interrupted Plex source downloads are retried up to twice without restarting FFmpeg or repeating audio. When Plex provides a strong ETag or a sufficiently old Last-Modified date, recovery uses HTTP Range and If-Range to resume at the consumed source byte offset, validating the partial response before continuing. If a safe validator is unavailable or Plex ignores Range, recovery re-downloads and verifies the consumed prefix with constant memory before feeding the remaining bytes to the encoder. Changed source metadata or prefix bytes, invalid partial responses, repeated failures, and client cancellation stop recovery without publishing a partial cache.
 - `X-Content-Duration` reports the response's audio duration in seconds (the remaining duration after a time offset). Players must read this header or the song metadata explicitly; it is separate from HTTP `Content-Length` and embedded MP3 duration metadata.
 - Transcode outputs are cached on disk (`TRANSCODE_CACHE_PATH`) to enable byte-range seeking on subsequent requests.
 - Completed cached responses include an exact `Content-Length` and support `206` byte ranges.
